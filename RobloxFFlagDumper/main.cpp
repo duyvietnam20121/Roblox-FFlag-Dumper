@@ -8,6 +8,7 @@
 // ---------------------------------------------------------------------------
 
 #include <charconv>
+#include <ctime>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -154,9 +155,9 @@ int main(int argc, char** argv) {
 
     Output::Meta meta;
     meta.process = options.process;
-    meta.generatedUtc = Output::UtcTimestamp();
+    meta.generatedAt = static_cast<long long>(std::time(nullptr));
     meta.imageSize = module->size;
-    if (const auto path = process.ImagePath()) meta.robloxVersion = Output::QueryFileVersion(*path);
+    if (const auto path = process.ImagePath()) meta.robloxVersion = Output::RobloxVersionFromPath(*path);
 
     std::error_code ec;
     std::filesystem::create_directories(options.outDir, ec);
