@@ -1,8 +1,8 @@
 // ---------------------------------------------------------------------------
 // RobloxFFlagDumper - dumps FFlag offsets from a running Roblox client.
 //
-// Usage:  RobloxFFlagDumper [--out <dir>] [--process <exe>] [--anchor Name=Value]
-//                           [--anchor2 Name=Value] [--no-verify]
+// Usage:  RobloxFFlagDumper [--out <dir>] [--process <exe>] [--anchor Name=Value]...
+//                           [--no-verify] [--values]
 //                           [--verbose] [--no-pause] [--help]
 //
 // Exit codes: 0 ok | 1 cannot attach | 2 map not found | 3 dump/IO failure | 64 bad usage
@@ -11,6 +11,7 @@
 #include <charconv>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <string>
 #include <string_view>
 
@@ -27,6 +28,7 @@ struct Options {
     std::filesystem::path outDir = ".";
     Scanner::Config scan;
     bool pause = true;
+    bool values = false;
     bool help = false;
 };
 
@@ -34,10 +36,13 @@ void PrintUsage() {
     std::cout << "RobloxFFlagDumper [options]\n"
                  "  --out <dir>            output directory (default: current directory)\n"
                  "  --process <exe>        target process (default: RobloxPlayerBeta.exe)\n"
-                 "  --anchor <Name=Value>  flag with a known value used to calibrate offsets\n"
+                 "  --anchor <Name=Value>  integer flag with a known value (landmark); repeatable.\n"
+                 "                         Max 4. Any landmark can locate the layout. With 1-2 landmarks all\n"
+                 "                         must match; with 3-4 one may differ. (--anchor2 is an alias.)\n"
                  "                         (default: BatchThumbnailMinWaitMs=15)\n"
-                 "  --anchor2 <Name=Value> optional 2nd int flag; the layout must resolve it too\n"
-                 "  --no-verify            skip the layout verification (coverage + --anchor2)\n"
+                 "  --values               also store each flag's current int value in FFlags.json\n"
+                 "                         (feed several dumps to pick_anchors.py to find stable anchors)\n"
+                 "  --no-verify            skip the layout verification (coverage + landmark check)\n"
                  "  --verbose              print scanning details\n"
                  "  --no-pause             do not wait for Enter before exiting\n"
                  "  --help                 show this help\n";
@@ -63,6 +68,7 @@ bool ParseNameValue(std::string_view text, std::string& name, int& value) {
 }
 
 bool ParseArgs(int argc, char** argv, Options& options) {
+    bool anchorsFromUser = false;
     for (int i = 1; i < argc; ++i) {
         const std::string_view arg = argv[i];
         const auto needValue = [&](std::string_view flag) -> const char* {
@@ -87,13 +93,19 @@ bool ParseArgs(int argc, char** argv, Options& options) {
             const char* value = needValue(arg);
             if (!value) return false;
             options.process = value;
-        } else if (arg == "--anchor") {
+        } else if (arg == "--anchor" || arg == "--anchor2") {
             const char* value = needValue(arg);
-            if (!value || !ParseNameValue(value, options.scan.anchorName, options.scan.anchorValue)) return false;
-        } else if (arg == "--anchor2") {
-            const char* value = needValue(arg);
-            if (!value || !ParseNameValue(value, options.scan.secondAnchorName, options.scan.secondAnchorValue))
+            Scanner::Anchor anchor;
+            if (!value || !ParseNameValue(value, anchor.name, anchor.value)) return false;
+            if (!anchorsFromUser) options.scan.anchors.clear();  // user landmarks replace the default
+            if (options.scan.anchors.size() >= Scanner::kMaxAnchors) {
+                std::cerr << "At most " << Scanner::kMaxAnchors << " --anchor landmarks are supported\n";
                 return false;
+            }
+            anchorsFromUser = true;
+            options.scan.anchors.push_back(std::move(anchor));
+        } else if (arg == "--values") {
+            options.values = true;
         } else if (arg == "--no-verify") {
             options.scan.verify = false;
         } else {
@@ -145,13 +157,19 @@ int main(int argc, char** argv) {
               << "Image size : " << Memory::ToHex(module->size) << '\n';
 
     // --- calibrate ---------------------------------------------------------
-    std::cout << "Scanning for the FFlag map (anchor " << options.scan.anchorName << " = "
-              << options.scan.anchorValue << ")...\n";
+    std::cout << "Scanning for the FFlag map (landmarks:";
+    for (const auto& anchor : options.scan.anchors) std::cout << ' ' << anchor.name << '=' << anchor.value;
+    std::cout << ")...\n";
     Scanner::LayoutFinder finder(process, *module, options.scan);
     const auto layout = finder.Find();
     if (!layout) {
-        std::cerr << "FFlag map not found. If Roblox changed the anchor flag's value, "
-                     "pass a new one with --anchor Name=Value (see --verbose).\n";
+        if (!finder.LastRejection().empty()) {
+            std::cerr << "A map was found but its layout was rejected:\n";
+            for (const auto& line : finder.LastRejection()) std::cerr << "  - " << line << '\n';
+            std::cerr << "(use --no-verify to accept it anyway)\n\n";
+        }
+        std::cerr << "FFlag map not found. If Roblox changed a landmark's value, pass new ones with "
+                     "--anchor Name=Value (repeatable, see --verbose).\n";
         return Finish(kMapNotFound, options.pause);
     }
     std::cout << "Map slot    : " << Memory::ToHex(layout->mapGlobalRva) << '\n'
@@ -175,7 +193,13 @@ int main(int argc, char** argv) {
     std::filesystem::create_directories(options.outDir, ec);
     const auto jsonPath = options.outDir / "FFlags.json";
     const auto headerPath = options.outDir / "FFlags.hpp";
-    if (!Output::WriteJson(jsonPath, meta, *layout, *dump) ||
+    std::map<std::string, int> values;
+    if (options.values) {
+        for (const auto& [name, rva] : dump->flags) {
+            if (const auto value = process.Read<int>(module->base + rva)) values.emplace(name, *value);
+        }
+    }
+    if (!Output::WriteJson(jsonPath, meta, *layout, *dump, options.values ? &values : nullptr) ||
         !Output::WriteHeader(headerPath, meta, *layout, *dump)) {
         std::cerr << "Could not write output files into " << options.outDir.string() << '\n';
         return Finish(kDumpFailed, options.pause);

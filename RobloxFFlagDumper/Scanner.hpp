@@ -10,13 +10,13 @@
 //         if *p != 0x3F800000 (1.0f)      -> not an unordered_map object, skip
 //         head  = *(p + 8)                -> list sentinel
 //         node  = *head                   -> first element
-//         walk the list until node name == anchor ("BatchThumbnailMinWaitMs")
-//         brute-force the two offsets so that  **(node+A + B) == anchorValue
+//         walk the list; every node whose name is one of the anchors ("BatchThumbnailMinWaitMs", ...)
+//         brute-force the two offsets so that  **(node+A + B) == that anchor's value
 //         -> Layout{ slotRva, A (ValueGetSet), B (FlagToValue) }
 //         VERIFY the layout before accepting it (see LayoutFinder::Verify):
 //           a) coverage: walk the whole list with it; a wrong layout resolves almost
 //              no value pointers into the module image, a right one resolves most
-//           b) optional second anchor flag: must resolve to its expected value
+//           b) anchors: RequiredMatches(#anchors) of them must read back their expected value
 //
 //   DumpFlags(layout):
 //     walk the circular list, for every node: name, value-pointer
@@ -43,11 +43,24 @@ inline constexpr std::uintptr_t kMinMapPointer = 0x100000;
 inline constexpr std::uintptr_t kMinValueRva = 0x10000;
 inline constexpr std::size_t kPageSize = 0x1000;
 
+inline constexpr std::size_t kMaxAnchors = 4;
+
+// How many anchors must read back their expected value: all of them when 1-2 are given,
+// all but one when 3-4 are given (so a single changed default does not break the dump).
+[[nodiscard]] constexpr std::size_t RequiredMatches(std::size_t anchorCount) noexcept {
+    return anchorCount <= 2 ? anchorCount : anchorCount - 1;
+}
+
+// An integer flag with a known value, used as a landmark in the flag map.
+struct Anchor {
+    std::string name;
+    int value = 0;
+};
+
 struct Config {
-    std::string anchorName = "BatchThumbnailMinWaitMs";  // flag with a known value
-    int anchorValue = 15;                                // ...update if Roblox changes it
-    std::string secondAnchorName;                        // optional 2nd int flag (--anchor2)
-    int secondAnchorValue = 0;
+    // Landmarks (--anchor Name=Value, repeatable). Any of them can locate the layout;
+    // at most kMaxAnchors; see RequiredMatches() for how many must match.
+    std::vector<Anchor> anchors = {{"BatchThumbnailMinWaitMs", 15}};
     bool verify = true;                                  // --no-verify disables the checks
     double minCoverage = 0.5;                            // share of usable entries required
     std::uintptr_t legacyStart = 0x7000000;              // proven range from v1
@@ -186,6 +199,9 @@ public:
     LayoutFinder(const Memory::Process& process, const Memory::ModuleInfo& module, const Config& config)
         : process_(process), module_(module), config_(config) {}
 
+    // Why the last layout candidate was rejected (empty if none was reached).
+    [[nodiscard]] const std::vector<std::string>& LastRejection() const noexcept { return report_; }
+
     [[nodiscard]] std::optional<Layout> Find() {
         // 1) The range that is known to work - fast path.
         const Range legacy{config_.legacyStart, std::min<std::uintptr_t>(config_.legacyEnd, module_.size)};
@@ -260,14 +276,17 @@ private:
         std::uintptr_t node = *first;
         for (std::size_t n = 0; n < config_.maxListNodes && Memory::IsUserPointer(node) && node != *head; ++n) {
             const auto name = process_.ReadMsvcString(node + kNodeNameOffset);
-            if (name && *name == config_.anchorName) {
-                if (auto layout = ProbeAnchor(node, slotRva)) {
-                    if (Verify(*layout)) return layout;
-                    return std::nullopt;  // wrong layout for this map: keep scanning others
+            if (name) {
+                for (const Anchor& anchor : config_.anchors) {
+                    if (*name != anchor.name) continue;
+                    if (const auto layout = ProbeAnchor(node, slotRva, anchor.value)) {
+                        if (Verify(*layout)) return layout;
+                        if (config_.verbose)
+                            std::cout << "[scan]   layout from anchor '" << anchor.name << "' rejected\n";
+                    } else if (config_.verbose) {
+                        std::cout << "[scan]   anchor '" << anchor.name << "' found but value offsets not matched\n";
+                    }
                 }
-                if (config_.verbose)
-                    std::cout << "[scan]   anchor '" << config_.anchorName << "' found but value offsets not matched\n";
-                return std::nullopt;
             }
             const auto next = process_.Read<std::uintptr_t>(node);
             if (!next || *next == node) break;
@@ -277,7 +296,7 @@ private:
     }
 
     // Brute-forces the two offsets so that the anchor flag's value is reachable.
-    std::optional<Layout> ProbeAnchor(std::uintptr_t node, std::uintptr_t slotRva) const {
+    std::optional<Layout> ProbeAnchor(std::uintptr_t node, std::uintptr_t slotRva, int expected) const {
         for (std::uintptr_t getSet = 0x20; getSet <= 0x100; getSet += 8) {
             const auto object = process_.Read<std::uintptr_t>(node + getSet);
             if (!object || !Memory::IsUserPointer(*object)) continue;
@@ -287,50 +306,63 @@ private:
                 if (!pointer || !Memory::IsUserPointer(*pointer)) continue;
 
                 const auto value = process_.Read<int>(*pointer);
-                if (value && *value == config_.anchorValue) return Layout{slotRva, getSet, toValue};
+                if (value && *value == expected) return Layout{slotRva, getSet, toValue};
             }
         }
         return std::nullopt;
     }
 
-    // Second opinion on a layout found with the first anchor.
-    bool Verify(const Layout& layout) const {
+    // Second opinion on a layout found with one anchor. The outcome is recorded in
+    // report_ (always, not only with --verbose) so a failed run can explain itself.
+    bool Verify(const Layout& layout) {
         if (!config_.verify) return true;
+        report_.clear();
 
         const auto dump = DumpFlags(process_, module_, layout, config_);
         if (!dump) {
-            if (config_.verbose) std::cout << "[verify] could not walk the list with this layout\n";
+            Note("could not walk the flag list with this layout");
             return false;
         }
 
         const double coverage = Coverage(dump->stats);
-        if (config_.verbose)
-            std::cout << "[verify] coverage " << static_cast<int>(coverage * 100) << "% ("
-                      << dump->stats.dumped << " flags)\n";
+        Note("coverage " + std::to_string(static_cast<int>(coverage * 100)) + "% (" +
+             std::to_string(dump->stats.dumped) + " flags)");
         if (dump->flags.empty() || coverage < config_.minCoverage) {
-            if (config_.verbose) std::cout << "[verify] rejected: coverage too low\n";
+            Note("rejected: coverage too low");
             return false;
         }
 
-        if (!config_.secondAnchorName.empty()) {
-            const auto it = dump->flags.find(config_.secondAnchorName);
-            if (it == dump->flags.end()) {
-                if (config_.verbose) std::cout << "[verify] rejected: second anchor not in dump\n";
-                return false;
+        if (!config_.anchors.empty()) {
+            std::size_t matches = 0;
+            for (const Anchor& anchor : config_.anchors) {
+                const auto it = dump->flags.find(anchor.name);
+                if (it == dump->flags.end()) {
+                    Note("anchor " + anchor.name + ": not found in the dump");
+                    continue;
+                }
+                const auto value = process_.Read<int>(module_.base + it->second);
+                Note("anchor " + anchor.name + ": expected " + std::to_string(anchor.value) + ", read " +
+                     (value ? std::to_string(*value) : std::string("(unreadable)")));
+                if (value && *value == anchor.value) ++matches;
             }
-            const auto value = process_.Read<int>(module_.base + it->second);
-            if (!value || *value != config_.secondAnchorValue) {
-                if (config_.verbose) std::cout << "[verify] rejected: second anchor value mismatch\n";
-                return false;
-            }
+            const std::size_t required = RequiredMatches(config_.anchors.size());
+            Note("anchors matched " + std::to_string(matches) + "/" + std::to_string(config_.anchors.size()) +
+                 " (need " + std::to_string(required) + ")");
+            if (matches < required) return false;
         }
         return true;
+    }
+
+    void Note(const std::string& line) {
+        report_.push_back(line);
+        if (config_.verbose) std::cout << "[verify] " << line << '\n';
     }
 
     const Memory::Process& process_;
     const Memory::ModuleInfo& module_;
     const Config& config_;
     std::unordered_set<std::uintptr_t> checked_;
+    std::vector<std::string> report_;
 };
 
 }  // namespace Scanner

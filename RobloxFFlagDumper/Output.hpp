@@ -13,6 +13,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <set>
 #include <string>
 #include <string_view>
@@ -83,8 +84,11 @@ struct Meta {
     return id;
 }
 
+// `values` (optional, --values): current int32 read at every flag's value address. Used to
+// pick long-lived anchors by comparing several dumps (see pick_anchors.py).
 [[nodiscard]] inline bool WriteJson(const std::filesystem::path& path, const Meta& meta,
-                                    const Scanner::Layout& layout, const Scanner::DumpResult& dump) {
+                                    const Scanner::Layout& layout, const Scanner::DumpResult& dump,
+                                    const std::map<std::string, int>* values = nullptr) {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) return false;
 
@@ -109,7 +113,18 @@ struct Meta {
         first = false;
         out << "        \"" << JsonEscape(name) << "\": \"" << Memory::ToHex(rva) << '"';
     }
-    out << "\n    }\n}\n";
+    out << "\n    }";
+    if (values) {
+        out << ",\n    \"Values\": {\n";
+        first = true;
+        for (const auto& [name, value] : *values) {
+            if (!first) out << ",\n";
+            first = false;
+            out << "        \"" << JsonEscape(name) << "\": " << value;
+        }
+        out << "\n    }";
+    }
+    out << "\n}\n";
     return out.good();
 }
 
