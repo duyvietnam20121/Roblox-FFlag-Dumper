@@ -37,6 +37,8 @@ void PrintUsage() {
                  "  --out <dir>            output directory (default: current directory)\n"
                  "  --process <exe>        target process (default: RobloxPlayerBeta.exe)\n"
                  "  --anchor <Name=Value>  integer flag with a known value (landmark); repeatable.\n"
+                 "                         Default: BatchThumbnailMinWaitMs=15, StreamingSafeMemWatermarkMB=100\n"
+                 "                         (either one is enough). Your own landmarks replace the default.\n"
                  "                         Max 4. Any landmark can locate the layout. With 1-2 landmarks all\n"
                  "                         must match; with 3-4 one may differ. (--anchor2 is an alias.)\n"
                  "                         (default: BatchThumbnailMinWaitMs=15)\n"
@@ -97,7 +99,10 @@ bool ParseArgs(int argc, char** argv, Options& options) {
             const char* value = needValue(arg);
             Scanner::Anchor anchor;
             if (!value || !ParseNameValue(value, anchor.name, anchor.value)) return false;
-            if (!anchorsFromUser) options.scan.anchors.clear();  // user landmarks replace the default
+            if (!anchorsFromUser) {  // user landmarks replace the built-in defaults
+                options.scan.anchors.clear();
+                options.scan.defaultAnchors = false;
+            }
             if (options.scan.anchors.size() >= Scanner::kMaxAnchors) {
                 std::cerr << "At most " << Scanner::kMaxAnchors << " --anchor landmarks are supported\n";
                 return false;

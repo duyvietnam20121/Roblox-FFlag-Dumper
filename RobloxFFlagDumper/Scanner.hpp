@@ -60,7 +60,11 @@ struct Anchor {
 struct Config {
     // Landmarks (--anchor Name=Value, repeatable). Any of them can locate the layout;
     // at most kMaxAnchors; see RequiredMatches() for how many must match.
-    std::vector<Anchor> anchors = {{"BatchThumbnailMinWaitMs", 15}};
+    std::vector<Anchor> anchors = {{"BatchThumbnailMinWaitMs", 15}, {"StreamingSafeMemWatermarkMB", 100}};
+    // True while the list above is the built-in default. Defaults are "soft": either one can
+    // locate the layout and one matching value is enough, so a Roblox update that changes one
+    // default does not break the tool. Landmarks given with --anchor are strict (RequiredMatches).
+    bool defaultAnchors = true;
     bool verify = true;                                  // --no-verify disables the checks
     double minCoverage = 0.5;                            // share of usable entries required
     std::uintptr_t legacyStart = 0x7000000;              // proven range from v1
@@ -345,7 +349,8 @@ private:
                      (value ? std::to_string(*value) : std::string("(unreadable)")));
                 if (value && *value == anchor.value) ++matches;
             }
-            const std::size_t required = RequiredMatches(config_.anchors.size());
+            const std::size_t required =
+                config_.defaultAnchors ? 1 : RequiredMatches(config_.anchors.size());
             Note("anchors matched " + std::to_string(matches) + "/" + std::to_string(config_.anchors.size()) +
                  " (need " + std::to_string(required) + ")");
             if (matches < required) return false;

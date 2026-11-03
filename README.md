@@ -23,7 +23,7 @@ RobloxFFlagDumper [--out <dir>] [--process <exe>] [--anchor Name=Value]
 | --- | --- |
 | `--out <dir>` | Output directory (default: current directory) |
 | `--process <exe>` | Target process (default `RobloxPlayerBeta.exe`) |
-| `--anchor Name=Value` | Integer flag with a known value (landmark). **Repeatable**: `--anchor A=1 --anchor B=2`. The first `--anchor` replaces the default (`BatchThumbnailMinWaitMs=15`). Max 4. Any landmark can locate the layout. With 1-2 landmarks all must read back their value; with 3-4 one may differ, so a single changed default does not break the dump. |
+| `--anchor Name=Value` | Integer flag with a known value (landmark). **Repeatable**: `--anchor A=1 --anchor B=2`. Default landmarks: `BatchThumbnailMinWaitMs=15` and `StreamingSafeMemWatermarkMB=100` - either one is enough, so one changed default does not break the tool. The first `--anchor` replaces the defaults, and your own landmarks are checked strictly. Max 4. Any landmark can locate the layout. With 1-2 landmarks all must read back their value; with 3-4 one may differ, so a single changed default does not break the dump. |
 | `--values` | Also store each flag's current int value in `FFlags.json` (`Values` block), to pick stable anchors |
 | `--no-verify` | Skip layout verification (coverage check and landmark check) |
 | `--verbose` | Print scanning details |
