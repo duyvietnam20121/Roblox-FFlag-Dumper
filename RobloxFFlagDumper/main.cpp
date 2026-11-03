@@ -2,13 +2,13 @@
 // RobloxFFlagDumper - dumps FFlag offsets from a running Roblox client.
 //
 // Usage:  RobloxFFlagDumper [--out <dir>] [--process <exe>] [--anchor Name=Value]
+//                           [--anchor2 Name=Value] [--no-verify]
 //                           [--verbose] [--no-pause] [--help]
 //
 // Exit codes: 0 ok | 1 cannot attach | 2 map not found | 3 dump/IO failure | 64 bad usage
 // ---------------------------------------------------------------------------
 
 #include <charconv>
-#include <ctime>
 #include <filesystem>
 #include <iostream>
 #include <string>
@@ -36,9 +36,30 @@ void PrintUsage() {
                  "  --process <exe>        target process (default: RobloxPlayerBeta.exe)\n"
                  "  --anchor <Name=Value>  flag with a known value used to calibrate offsets\n"
                  "                         (default: BatchThumbnailMinWaitMs=15)\n"
+                 "  --anchor2 <Name=Value> optional 2nd int flag; the layout must resolve it too\n"
+                 "  --no-verify            skip the layout verification (coverage + --anchor2)\n"
                  "  --verbose              print scanning details\n"
                  "  --no-pause             do not wait for Enter before exiting\n"
                  "  --help                 show this help\n";
+}
+
+// "Name=123" -> name + integer value.
+bool ParseNameValue(std::string_view text, std::string& name, int& value) {
+    const auto eq = text.find('=');
+    if (eq == std::string_view::npos || eq == 0) {
+        std::cerr << "Expected Name=Value, got: " << text << '\n';
+        return false;
+    }
+    const std::string_view number = text.substr(eq + 1);
+    int parsed = 0;
+    const auto [end, ec] = std::from_chars(number.data(), number.data() + number.size(), parsed);
+    if (ec != std::errc{} || end != number.data() + number.size()) {
+        std::cerr << "Value must be an integer: " << text << '\n';
+        return false;
+    }
+    name = std::string(text.substr(0, eq));
+    value = parsed;
+    return true;
 }
 
 bool ParseArgs(int argc, char** argv, Options& options) {
@@ -68,22 +89,13 @@ bool ParseArgs(int argc, char** argv, Options& options) {
             options.process = value;
         } else if (arg == "--anchor") {
             const char* value = needValue(arg);
-            if (!value) return false;
-            const std::string_view text = value;
-            const auto eq = text.find('=');
-            if (eq == std::string_view::npos || eq == 0) {
-                std::cerr << "--anchor expects Name=Value\n";
+            if (!value || !ParseNameValue(value, options.scan.anchorName, options.scan.anchorValue)) return false;
+        } else if (arg == "--anchor2") {
+            const char* value = needValue(arg);
+            if (!value || !ParseNameValue(value, options.scan.secondAnchorName, options.scan.secondAnchorValue))
                 return false;
-            }
-            const std::string_view number = text.substr(eq + 1);
-            int parsed = 0;
-            const auto [end, ec] = std::from_chars(number.data(), number.data() + number.size(), parsed);
-            if (ec != std::errc{} || end != number.data() + number.size()) {
-                std::cerr << "--anchor value must be an integer\n";
-                return false;
-            }
-            options.scan.anchorName = std::string(text.substr(0, eq));
-            options.scan.anchorValue = parsed;
+        } else if (arg == "--no-verify") {
+            options.scan.verify = false;
         } else {
             std::cerr << "Unknown argument: " << arg << '\n';
             return false;
@@ -155,7 +167,7 @@ int main(int argc, char** argv) {
 
     Output::Meta meta;
     meta.process = options.process;
-    meta.generatedAt = static_cast<long long>(std::time(nullptr));
+    meta.generatedAt = Output::Timestamp();
     meta.imageSize = module->size;
     if (const auto path = process.ImagePath()) meta.robloxVersion = Output::RobloxVersionFromPath(*path);
 
@@ -173,7 +185,9 @@ int main(int argc, char** argv) {
     std::cout << "\nDumped " << s.dumped << " flags (" << meta.robloxVersion << ") -> "
               << jsonPath.string() << ", " << headerPath.string() << '\n'
               << "Nodes visited: " << s.nodes << " | skipped: bad name " << s.badName << ", bad pointer "
-              << s.badPointer << ", string-valued " << s.stringValued << ", duplicates " << s.duplicates << '\n';
+              << s.badPointer << ", string-valued " << s.stringValued << ", duplicates " << s.duplicates << '\n'
+              << "Layout coverage: " << static_cast<int>(Scanner::Coverage(s) * 100) << "%"
+              << (options.scan.verify ? " (verified)" : " (verification skipped)") << '\n';
     if (s.truncated) std::cout << "Warning: node limit reached - the list may be incomplete.\n";
 
     return Finish(kOk, options.pause);

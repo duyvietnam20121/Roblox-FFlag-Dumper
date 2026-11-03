@@ -13,6 +13,10 @@
 //         walk the list until node name == anchor ("BatchThumbnailMinWaitMs")
 //         brute-force the two offsets so that  **(node+A + B) == anchorValue
 //         -> Layout{ slotRva, A (ValueGetSet), B (FlagToValue) }
+//         VERIFY the layout before accepting it (see LayoutFinder::Verify):
+//           a) coverage: walk the whole list with it; a wrong layout resolves almost
+//              no value pointers into the module image, a right one resolves most
+//           b) optional second anchor flag: must resolve to its expected value
 //
 //   DumpFlags(layout):
 //     walk the circular list, for every node: name, value-pointer
@@ -42,6 +46,10 @@ inline constexpr std::size_t kPageSize = 0x1000;
 struct Config {
     std::string anchorName = "BatchThumbnailMinWaitMs";  // flag with a known value
     int anchorValue = 15;                                // ...update if Roblox changes it
+    std::string secondAnchorName;                        // optional 2nd int flag (--anchor2)
+    int secondAnchorValue = 0;
+    bool verify = true;                                  // --no-verify disables the checks
+    double minCoverage = 0.5;                            // share of usable entries required
     std::uintptr_t legacyStart = 0x7000000;              // proven range from v1
     std::uintptr_t legacyEnd = 0x12000000;
     std::size_t chunkSize = 0x10000;                     // multiple of kPageSize
@@ -75,6 +83,13 @@ struct DumpResult {
     DumpStats stats;
 };
 
+// Share of entries (with a valid name and non-string value) whose value pointer
+// resolved into the module image. ~0 for a wrong layout, high for the right one.
+[[nodiscard]] inline double Coverage(const DumpStats& s) {
+    const std::size_t usable = s.dumped + s.duplicates + s.badPointer;
+    return usable ? static_cast<double>(s.dumped + s.duplicates) / static_cast<double>(usable) : 0.0;
+}
+
 // Writable, non-executable PE sections (.data & friends) as RVA ranges.
 [[nodiscard]] inline std::vector<Range> ReadDataSections(const Memory::Process& process,
                                                          const Memory::ModuleInfo& module) {
@@ -104,6 +119,66 @@ struct DumpResult {
         }
     }
     return ranges;
+}
+
+// Walks the flag list and collects name -> RVA for every usable entry.
+[[nodiscard]] inline std::optional<DumpResult> DumpFlags(const Memory::Process& process,
+                                                         const Memory::ModuleInfo& module,
+                                                         const Layout& layout, const Config& config) {
+    const auto mapObject = process.Read<std::uintptr_t>(module.base + layout.mapGlobalRva);
+    if (!mapObject || !Memory::IsUserPointer(*mapObject)) return std::nullopt;
+
+    const auto head = process.Read<std::uintptr_t>(*mapObject + kMapHeadOffset);
+    if (!head || !Memory::IsUserPointer(*head)) return std::nullopt;
+
+    const auto first = process.Read<std::uintptr_t>(*head);
+    if (!first) return std::nullopt;
+
+    DumpResult result;
+    DumpStats& stats = result.stats;
+
+    std::uintptr_t node = *first;
+    while (Memory::IsUserPointer(node) && node != *head) {
+        if (stats.nodes >= config.maxListNodes) {
+            stats.truncated = true;
+            break;
+        }
+        ++stats.nodes;
+
+        // Read the successor first so every `continue` below can still advance.
+        const auto next = process.Read<std::uintptr_t>(node);
+
+        [&] {
+            const auto name = process.ReadMsvcString(node + kNodeNameOffset);
+            if (!name) { ++stats.badName; return; }
+
+            const auto getSet = process.Read<std::uintptr_t>(node + layout.valueGetSet);
+            if (!getSet || !Memory::IsUserPointer(*getSet)) { ++stats.badPointer; return; }
+
+            // Entries whose "value" is the text True/False are not offsets.
+            if (const auto text = process.ReadMsvcString(*getSet + layout.flagToValue);
+                text && (*text == "True" || *text == "False")) {
+                ++stats.stringValued;
+                return;
+            }
+
+            const auto valuePointer = process.Read<std::uintptr_t>(*getSet + layout.flagToValue);
+            // The value must live inside the module image, otherwise the RVA is meaningless.
+            if (!valuePointer || *valuePointer < module.base ||
+                *valuePointer - module.base >= module.size ||
+                *valuePointer - module.base < kMinValueRva) {
+                ++stats.badPointer;
+                return;
+            }
+
+            if (result.flags.emplace(*name, *valuePointer - module.base).second) ++stats.dumped;
+            else ++stats.duplicates;
+        }();
+
+        if (!next || *next == node) break;
+        node = *next;
+    }
+    return result;
 }
 
 class LayoutFinder {
@@ -186,7 +261,10 @@ private:
         for (std::size_t n = 0; n < config_.maxListNodes && Memory::IsUserPointer(node) && node != *head; ++n) {
             const auto name = process_.ReadMsvcString(node + kNodeNameOffset);
             if (name && *name == config_.anchorName) {
-                if (auto layout = ProbeAnchor(node, slotRva)) return layout;
+                if (auto layout = ProbeAnchor(node, slotRva)) {
+                    if (Verify(*layout)) return layout;
+                    return std::nullopt;  // wrong layout for this map: keep scanning others
+                }
                 if (config_.verbose)
                     std::cout << "[scan]   anchor '" << config_.anchorName << "' found but value offsets not matched\n";
                 return std::nullopt;
@@ -215,70 +293,44 @@ private:
         return std::nullopt;
     }
 
+    // Second opinion on a layout found with the first anchor.
+    bool Verify(const Layout& layout) const {
+        if (!config_.verify) return true;
+
+        const auto dump = DumpFlags(process_, module_, layout, config_);
+        if (!dump) {
+            if (config_.verbose) std::cout << "[verify] could not walk the list with this layout\n";
+            return false;
+        }
+
+        const double coverage = Coverage(dump->stats);
+        if (config_.verbose)
+            std::cout << "[verify] coverage " << static_cast<int>(coverage * 100) << "% ("
+                      << dump->stats.dumped << " flags)\n";
+        if (dump->flags.empty() || coverage < config_.minCoverage) {
+            if (config_.verbose) std::cout << "[verify] rejected: coverage too low\n";
+            return false;
+        }
+
+        if (!config_.secondAnchorName.empty()) {
+            const auto it = dump->flags.find(config_.secondAnchorName);
+            if (it == dump->flags.end()) {
+                if (config_.verbose) std::cout << "[verify] rejected: second anchor not in dump\n";
+                return false;
+            }
+            const auto value = process_.Read<int>(module_.base + it->second);
+            if (!value || *value != config_.secondAnchorValue) {
+                if (config_.verbose) std::cout << "[verify] rejected: second anchor value mismatch\n";
+                return false;
+            }
+        }
+        return true;
+    }
+
     const Memory::Process& process_;
     const Memory::ModuleInfo& module_;
     const Config& config_;
     std::unordered_set<std::uintptr_t> checked_;
 };
-
-// Walks the flag list and collects name -> RVA for every usable entry.
-[[nodiscard]] inline std::optional<DumpResult> DumpFlags(const Memory::Process& process,
-                                                         const Memory::ModuleInfo& module,
-                                                         const Layout& layout, const Config& config) {
-    const auto mapObject = process.Read<std::uintptr_t>(module.base + layout.mapGlobalRva);
-    if (!mapObject || !Memory::IsUserPointer(*mapObject)) return std::nullopt;
-
-    const auto head = process.Read<std::uintptr_t>(*mapObject + kMapHeadOffset);
-    if (!head || !Memory::IsUserPointer(*head)) return std::nullopt;
-
-    const auto first = process.Read<std::uintptr_t>(*head);
-    if (!first) return std::nullopt;
-
-    DumpResult result;
-    DumpStats& stats = result.stats;
-
-    std::uintptr_t node = *first;
-    while (Memory::IsUserPointer(node) && node != *head) {
-        if (stats.nodes >= config.maxListNodes) {
-            stats.truncated = true;
-            break;
-        }
-        ++stats.nodes;
-
-        // Read the successor first so every `continue` below can still advance.
-        const auto next = process.Read<std::uintptr_t>(node);
-
-        [&] {
-            const auto name = process.ReadMsvcString(node + kNodeNameOffset);
-            if (!name) { ++stats.badName; return; }
-
-            const auto getSet = process.Read<std::uintptr_t>(node + layout.valueGetSet);
-            if (!getSet || !Memory::IsUserPointer(*getSet)) { ++stats.badPointer; return; }
-
-            // Entries whose "value" is the text True/False are not offsets.
-            if (const auto text = process.ReadMsvcString(*getSet + layout.flagToValue);
-                text && (*text == "True" || *text == "False")) {
-                ++stats.stringValued;
-                return;
-            }
-
-            const auto valuePointer = process.Read<std::uintptr_t>(*getSet + layout.flagToValue);
-            // The value must live inside the module image, otherwise the RVA is meaningless.
-            if (!valuePointer || *valuePointer < module.base ||
-                *valuePointer - module.base >= module.size ||
-                *valuePointer - module.base < kMinValueRva) {
-                ++stats.badPointer;
-                return;
-            }
-
-            if (result.flags.emplace(*name, *valuePointer - module.base).second) ++stats.dumped;
-            else ++stats.duplicates;
-        }();
-
-        if (!next || *next == node) break;
-        node = *next;
-    }
-    return result;
-}
 
 }  // namespace Scanner

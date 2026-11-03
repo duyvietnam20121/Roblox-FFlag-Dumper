@@ -38,10 +38,10 @@ inline constexpr std::uintptr_t kMaxUserPointer = 0x00007FFFFFFFFFFFull;
     return p >= kMinUserPointer && p <= kMaxUserPointer;
 }
 
-// "0x1A2B" - upper-case hex without touching std::cout's sticky flags.
-[[nodiscard]] inline std::string ToHex(std::uintptr_t value) {
+// "0x1A2B" (or "0x1a2b" with upper = false) without touching std::cout's sticky flags.
+[[nodiscard]] inline std::string ToHex(std::uintptr_t value, bool upper = true) {
     std::ostringstream ss;
-    ss << "0x" << std::uppercase << std::hex << value;
+    ss << "0x" << (upper ? std::uppercase : std::nouppercase) << std::hex << value;
     return ss.str();
 }
 
@@ -150,31 +150,37 @@ public:
     // Reads an MSVC x64 std::string located at `address`.
     //
     // Layout: +0x00 inline buffer / heap pointer, +0x10 size, +0x18 capacity.
-    // The original dumper keys off the +0x18 field (capacity) - capacity < 16
-    // means the text is stored inline (SSO), otherwise +0x00 is a heap pointer.
-    // That behaviour is kept on purpose so results stay identical; the text is
-    // cut at the first NUL. Returns nullopt for anything that does not look
-    // like a sane string (instead of the old "ERROR (1)" magic strings, which
-    // used to leak into the generated output).
+    //  * capacity <= 15  -> text is stored inline (SSO) at +0x00
+    //  * capacity >= 16  -> +0x00 is a heap pointer
+    // `size` gives the exact length (no over-reading up to capacity, no
+    // "cut at first NUL" guessing) and `size <= capacity` is a strong sanity
+    // check that rejects random memory. Returns nullopt for anything that does
+    // not look like a sane, non-empty string without embedded NULs.
     [[nodiscard]] std::optional<std::string> ReadMsvcString(std::uintptr_t address) const {
-        constexpr int kMaxLength = 1000;
-        constexpr std::uint32_t kSsoCapacity = 16;
+        constexpr std::uint64_t kMaxLength = 1000;
+        constexpr std::uint64_t kMaxCapacity = 1u << 20;
+        constexpr std::uint64_t kSsoCapacity = 15;
 
-        const auto field = Read<int>(address + 0x18);
-        if (!field || *field <= 0 || *field > kMaxLength) return std::nullopt;
+        struct Header {
+            std::uint64_t size;
+            std::uint64_t capacity;
+        } header{};
+        if (!ReadBytes(address + 0x10, &header, sizeof(header))) return std::nullopt;
+
+        if (header.size == 0 || header.size > kMaxLength || header.size > header.capacity ||
+            header.capacity > kMaxCapacity)
+            return std::nullopt;
 
         std::uintptr_t data = address;
-        if (static_cast<std::uint32_t>(*field) >= kSsoCapacity) {
+        if (header.capacity > kSsoCapacity) {
             const auto pointer = Read<std::uintptr_t>(address);
             if (!pointer || !IsUserPointer(*pointer)) return std::nullopt;
             data = *pointer;
         }
 
-        std::string text(static_cast<std::size_t>(*field), '\0');
+        std::string text(static_cast<std::size_t>(header.size), '\0');
         if (!ReadBytes(data, text.data(), text.size())) return std::nullopt;
-
-        if (const auto nul = text.find('\0'); nul != std::string::npos) text.resize(nul);
-        if (text.empty()) return std::nullopt;
+        if (text.find('\0') != std::string::npos) return std::nullopt;
         return text;
     }
 
