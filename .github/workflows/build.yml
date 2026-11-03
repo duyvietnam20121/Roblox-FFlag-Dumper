@@ -1,0 +1,70 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}
+    # Pinned: windows-2022 ships VS 2022 (toolset v143) incl. the ARM64 build tools.
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [x64, ARM64]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build (Release | ${{ matrix.platform }})
+        run: >
+          msbuild RobloxFFlagDumper.sln
+          /m /nologo /verbosity:minimal
+          /p:Configuration=Release
+          /p:Platform=${{ matrix.platform }}
+
+      - name: Collect binary
+        shell: pwsh
+        run: |
+          $exe = "${{ matrix.platform }}\Release\RobloxFFlagDumper.exe"
+          if (-not (Test-Path $exe)) { throw "Build output not found: $exe" }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item $exe "dist\RobloxFFlagDumper-${{ matrix.platform }}.exe"
+
+      # x64 binaries can run here: smoke-test the CLI (no Roblox needed).
+      - name: Smoke test (--help)
+        if: matrix.platform == 'x64'
+        run: dist\RobloxFFlagDumper-x64.exe --help
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RobloxFFlagDumper-${{ matrix.platform }}
+          path: dist/RobloxFFlagDumper-${{ matrix.platform }}.exe
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.exe
+          generate_release_notes: true
