@@ -39,7 +39,7 @@ Exit codes: `0` ok, `1` cannot attach, `2` map not found, `3` dump/IO failure, `
 
 ## Output
 
-`FFlags.json` contains `Meta` (Roblox version, UTC time, flag count), `FFlagOffsets` and `FFlags`.
+`FFlags.json` contains `Meta` (Roblox version hash taken from the `version-<hash>` install folder, Unix time, flag count), `FFlagOffsets` and `FFlags`.
 Entries are sorted by name, so two dumps can be compared with a plain `diff`.
 `FFlags.hpp` uses `inline constexpr std::uintptr_t`, so it can be included from multiple translation units.
 
