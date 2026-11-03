@@ -121,6 +121,19 @@ bool ParseArgs(int argc, char** argv, Options& options) {
     return true;
 }
 
+std::string Percent(double ratio) { return std::to_string(static_cast<int>(ratio * 100)) + "%"; }
+
+std::string VerificationSummary(const Scanner::VerifyInfo& v, bool enabled) {
+    if (!enabled || !v.performed) return "Verification: skipped (--no-verify)";
+    std::string text = "Verification: coverage " + Percent(v.coverage) + " | unique addresses " + Percent(v.uniqueRvas);
+    if (v.declaredSize) {
+        text += " | list size " + std::to_string(*v.declaredSize) + " vs walked " + std::to_string(v.walkedNodes) +
+                (*v.declaredSize == v.walkedNodes ? " (match)" : " (MISMATCH)");
+    }
+    text += " | landmarks " + std::to_string(v.anchorsMatched) + "/" + std::to_string(v.anchorsTotal);
+    return text;
+}
+
 int Finish(int code, bool pause) {
     if (pause) {
         std::cout << "\nPress Enter to exit...";
@@ -215,8 +228,7 @@ int main(int argc, char** argv) {
               << jsonPath.string() << ", " << headerPath.string() << '\n'
               << "Nodes visited: " << s.nodes << " | skipped: bad name " << s.badName << ", bad pointer "
               << s.badPointer << ", string-valued " << s.stringValued << ", duplicates " << s.duplicates << '\n'
-              << "Layout coverage: " << static_cast<int>(Scanner::Coverage(s) * 100) << "%"
-              << (options.scan.verify ? " (verified)" : " (verification skipped)") << '\n';
+              << VerificationSummary(finder.Verification(), options.scan.verify) << '\n';
     if (s.truncated) std::cout << "Warning: node limit reached - the list may be incomplete.\n";
 
     return Finish(kOk, options.pause);

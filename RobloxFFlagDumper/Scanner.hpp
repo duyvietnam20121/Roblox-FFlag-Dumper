@@ -16,7 +16,10 @@
 //         VERIFY the layout before accepting it (see LayoutFinder::Verify):
 //           a) coverage: walk the whole list with it; a wrong layout resolves almost
 //              no value pointers into the module image, a right one resolves most
-//           b) anchors: RequiredMatches(#anchors) of them must read back their expected value
+//           b) unique addresses: every flag has its own storage, so (almost) no two entries
+//              may resolve to the same value address
+//           c) list size: nodes walked vs. the map's own element count (reported, soft)
+//           d) anchors: RequiredMatches(#anchors) of them must read back their expected value
 //
 //   DumpFlags(layout):
 //     walk the circular list, for every node: name, value-pointer
@@ -38,6 +41,7 @@ namespace Scanner {
 // --- Roblox-specific layout constants (x64) --------------------------------
 inline constexpr std::uintptr_t kLoadFactorSignature = 0x3F800000;  // float 1.0f
 inline constexpr std::uintptr_t kMapHeadOffset = 0x8;               // list sentinel
+inline constexpr std::uintptr_t kMapSizeOffset = 0x10;             // element count (MSVC _List._Mysize)
 inline constexpr std::uintptr_t kNodeNameOffset = 0x10;             // std::string in node
 inline constexpr std::uintptr_t kMinMapPointer = 0x100000;
 inline constexpr std::uintptr_t kMinValueRva = 0x10000;
@@ -67,6 +71,7 @@ struct Config {
     bool defaultAnchors = true;
     bool verify = true;                                  // --no-verify disables the checks
     double minCoverage = 0.5;                            // share of usable entries required
+    double minUniqueRvas = 0.8;                          // share of distinct value addresses required
     std::uintptr_t legacyStart = 0x7000000;              // proven range from v1
     std::uintptr_t legacyEnd = 0x12000000;
     std::size_t chunkSize = 0x10000;                     // multiple of kPageSize
@@ -98,6 +103,17 @@ struct DumpStats {
 struct DumpResult {
     std::map<std::string, std::uintptr_t> flags;  // name -> RVA, sorted => stable diffs
     DumpStats stats;
+};
+
+// What the verification measured for the accepted layout (printed by main).
+struct VerifyInfo {
+    bool performed = false;
+    double coverage = 0.0;                         // entries resolved into the module image
+    double uniqueRvas = 0.0;                       // distinct value addresses / entries
+    std::size_t walkedNodes = 0;                   // list nodes visited
+    std::optional<std::uint64_t> declaredSize;     // element count stored in the map object
+    std::size_t anchorsMatched = 0;
+    std::size_t anchorsTotal = 0;
 };
 
 // Share of entries (with a valid name and non-string value) whose value pointer
@@ -202,6 +218,9 @@ class LayoutFinder {
 public:
     LayoutFinder(const Memory::Process& process, const Memory::ModuleInfo& module, const Config& config)
         : process_(process), module_(module), config_(config) {}
+
+    // Measurements of the last accepted layout (performed == false if verification was off).
+    [[nodiscard]] const VerifyInfo& Verification() const noexcept { return info_; }
 
     // Why the last layout candidate was rejected (empty if none was reached).
     [[nodiscard]] const std::vector<std::string>& LastRejection() const noexcept { return report_; }
@@ -321,6 +340,7 @@ private:
     bool Verify(const Layout& layout) {
         if (!config_.verify) return true;
         report_.clear();
+        VerifyInfo info;
 
         const auto dump = DumpFlags(process_, module_, layout, config_);
         if (!dump) {
@@ -334,6 +354,27 @@ private:
         if (dump->flags.empty() || coverage < config_.minCoverage) {
             Note("rejected: coverage too low");
             return false;
+        }
+        info.coverage = coverage;
+        info.walkedNodes = dump->stats.nodes;
+
+        // Every flag owns its storage: a wrong layout tends to funnel many entries to one address.
+        std::unordered_set<std::uintptr_t> addresses;
+        for (const auto& entry : dump->flags) addresses.insert(entry.second);
+        info.uniqueRvas = static_cast<double>(addresses.size()) / static_cast<double>(dump->flags.size());
+        Note("unique value addresses " + std::to_string(static_cast<int>(info.uniqueRvas * 100)) + "%");
+        if (info.uniqueRvas < config_.minUniqueRvas) {
+            Note("rejected: too many entries share one value address");
+            return false;
+        }
+
+        // The map object stores its own element count: compare it with what we walked (soft check).
+        if (const auto mapObject = process_.Read<std::uintptr_t>(module_.base + layout.mapGlobalRva))
+            info.declaredSize = process_.Read<std::uint64_t>(*mapObject + kMapSizeOffset);
+        if (info.declaredSize) {
+            Note("list size field " + std::to_string(*info.declaredSize) + ", walked " +
+                 std::to_string(info.walkedNodes) +
+                 (*info.declaredSize == info.walkedNodes ? " (match)" : " (differs - warning only)"));
         }
 
         if (!config_.anchors.empty()) {
@@ -354,7 +395,11 @@ private:
             Note("anchors matched " + std::to_string(matches) + "/" + std::to_string(config_.anchors.size()) +
                  " (need " + std::to_string(required) + ")");
             if (matches < required) return false;
+            info.anchorsMatched = matches;
+            info.anchorsTotal = config_.anchors.size();
         }
+        info.performed = true;
+        info_ = info;
         return true;
     }
 
@@ -368,6 +413,7 @@ private:
     const Config& config_;
     std::unordered_set<std::uintptr_t> checked_;
     std::vector<std::string> report_;
+    VerifyInfo info_;
 };
 
 }  // namespace Scanner
