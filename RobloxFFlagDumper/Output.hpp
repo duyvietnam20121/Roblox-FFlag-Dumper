@@ -1,0 +1,156 @@
+#pragma once
+// ---------------------------------------------------------------------------
+// Output.hpp - serialises a DumpResult to FFlags.json / FFlags.hpp.
+//
+//  * JSON keeps the real flag names (properly escaped).
+//  * The C++ header sanitises names into valid, unique identifiers and uses
+//    `inline constexpr`, so it can be included from several TUs.
+//  * Entries are sorted by name, so two dumps can be compared with a plain diff.
+// ---------------------------------------------------------------------------
+
+#include <Windows.h>
+#include <winver.h>
+
+#include <cctype>
+#include <cstdio>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <set>
+#include <string>
+#include <vector>
+
+#include "Memory.hpp"
+#include "Scanner.hpp"
+
+#pragma comment(lib, "version.lib")
+
+namespace Output {
+
+struct Meta {
+    std::string process;
+    std::string robloxVersion = "unknown";
+    std::string generatedUtc;
+    std::size_t imageSize = 0;
+};
+
+[[nodiscard]] inline std::string UtcTimestamp() {
+    const std::time_t now = std::time(nullptr);
+    std::tm utc{};
+    gmtime_s(&utc, &now);
+    char buffer[32]{};
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%dT%H:%M:%SZ", &utc);
+    return buffer;
+}
+
+// File version (e.g. "0.712.0.7120816") of the running executable.
+[[nodiscard]] inline std::string QueryFileVersion(const std::wstring& path) {
+    DWORD ignored = 0;
+    const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &ignored);
+    if (size == 0) return "unknown";
+
+    std::vector<BYTE> block(size);
+    if (!GetFileVersionInfoW(path.c_str(), 0, size, block.data())) return "unknown";
+
+    VS_FIXEDFILEINFO* info = nullptr;
+    UINT length = 0;
+    if (!VerQueryValueW(block.data(), L"\\", reinterpret_cast<LPVOID*>(&info), &length) || !info)
+        return "unknown";
+
+    char text[64]{};
+    std::snprintf(text, sizeof(text), "%u.%u.%u.%u", HIWORD(info->dwFileVersionMS),
+                  LOWORD(info->dwFileVersionMS), HIWORD(info->dwFileVersionLS),
+                  LOWORD(info->dwFileVersionLS));
+    return text;
+}
+
+[[nodiscard]] inline std::string JsonEscape(const std::string& text) {
+    std::string out;
+    out.reserve(text.size());
+    for (const unsigned char c : text) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char escaped[8];
+                    std::snprintf(escaped, sizeof(escaped), "\\u%04X", c);
+                    out += escaped;
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    return out;
+}
+
+// Valid C++ identifier: non-alnum -> '_', never starts with a digit.
+[[nodiscard]] inline std::string MakeIdentifier(const std::string& name) {
+    std::string id = name;
+    for (char& c : id) {
+        if (!std::isalnum(static_cast<unsigned char>(c))) c = '_';
+    }
+    if (id.empty() || std::isdigit(static_cast<unsigned char>(id.front()))) id.insert(id.begin(), '_');
+    return id;
+}
+
+[[nodiscard]] inline bool WriteJson(const std::filesystem::path& path, const Meta& meta,
+                                    const Scanner::Layout& layout, const Scanner::DumpResult& dump) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+
+    out << "{\n"
+        << "    \"Meta\": {\n"
+        << "        \"Process\": \"" << JsonEscape(meta.process) << "\",\n"
+        << "        \"RobloxVersion\": \"" << JsonEscape(meta.robloxVersion) << "\",\n"
+        << "        \"GeneratedUtc\": \"" << meta.generatedUtc << "\",\n"
+        << "        \"ImageSize\": \"" << Memory::ToHex(meta.imageSize) << "\",\n"
+        << "        \"FlagCount\": " << dump.flags.size() << "\n"
+        << "    },\n"
+        << "    \"FFlagOffsets\": {\n"
+        << "        \"FFlagList\": \"" << Memory::ToHex(layout.mapGlobalRva) << "\",\n"
+        << "        \"ValueGetSet\": \"" << Memory::ToHex(layout.valueGetSet) << "\",\n"
+        << "        \"FlagToValue\": \"" << Memory::ToHex(layout.flagToValue) << "\"\n"
+        << "    },\n"
+        << "    \"FFlags\": {\n";
+
+    bool first = true;
+    for (const auto& [name, rva] : dump.flags) {
+        if (!first) out << ",\n";
+        first = false;
+        out << "        \"" << JsonEscape(name) << "\": \"" << Memory::ToHex(rva) << '"';
+    }
+    out << "\n    }\n}\n";
+    return out.good();
+}
+
+[[nodiscard]] inline bool WriteHeader(const std::filesystem::path& path, const Meta& meta,
+                                      const Scanner::Layout& layout, const Scanner::DumpResult& dump) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+
+    out << "#pragma once\n"
+        << "#include <cstdint>\n\n"
+        << "// Generated by RobloxFFlagDumper - " << meta.process << ' ' << meta.robloxVersion << " - "
+        << meta.generatedUtc << "\n\n"
+        << "namespace FFlagOffsets\n{\n"
+        << "    inline constexpr std::uintptr_t FFlagList = " << Memory::ToHex(layout.mapGlobalRva) << ";\n"
+        << "    inline constexpr std::uintptr_t ValueGetSet = " << Memory::ToHex(layout.valueGetSet) << ";\n"
+        << "    inline constexpr std::uintptr_t FlagToValue = " << Memory::ToHex(layout.flagToValue) << ";\n"
+        << "}\n\n"
+        << "namespace FFlags\n{\n";
+
+    std::set<std::string> usedIdentifiers;
+    for (const auto& [name, rva] : dump.flags) {
+        const std::string id = MakeIdentifier(name);
+        if (!usedIdentifiers.insert(id).second) continue;  // sanitised name collided
+        out << "    inline constexpr std::uintptr_t " << id << " = " << Memory::ToHex(rva) << ";\n";
+    }
+    out << "}\n";
+    return out.good();
+}
+
+}  // namespace Output

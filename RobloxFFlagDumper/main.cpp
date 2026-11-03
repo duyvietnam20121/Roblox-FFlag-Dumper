@@ -1,215 +1,179 @@
-#include <Windows.h>
+// ---------------------------------------------------------------------------
+// RobloxFFlagDumper - dumps FFlag offsets from a running Roblox client.
+//
+// Usage:  RobloxFFlagDumper [--out <dir>] [--process <exe>] [--anchor Name=Value]
+//                           [--verbose] [--no-pause] [--help]
+//
+// Exit codes: 0 ok | 1 cannot attach | 2 map not found | 3 dump/IO failure | 64 bad usage
+// ---------------------------------------------------------------------------
+
+#include <charconv>
+#include <filesystem>
 #include <iostream>
 #include <string>
-#include <fstream>
-#include <vector>
-#include "Memory.hpp"
+#include <string_view>
 
-namespace offsets {
-    uintptr_t FFlagList = 0x0;
-	uintptr_t ValueGetSet = 0x0;
-    uintptr_t FlagToValue = 0x0;
+#include "Memory.hpp"
+#include "Output.hpp"
+#include "Scanner.hpp"
+
+namespace {
+
+enum ExitCode : int { kOk = 0, kAttachFailed = 1, kMapNotFound = 2, kDumpFailed = 3, kBadUsage = 64 };
+
+struct Options {
+    std::string process = "RobloxPlayerBeta.exe";
+    std::filesystem::path outDir = ".";
+    Scanner::Config scan;
+    bool pause = true;
+    bool help = false;
+};
+
+void PrintUsage() {
+    std::cout << "RobloxFFlagDumper [options]\n"
+                 "  --out <dir>            output directory (default: current directory)\n"
+                 "  --process <exe>        target process (default: RobloxPlayerBeta.exe)\n"
+                 "  --anchor <Name=Value>  flag with a known value used to calibrate offsets\n"
+                 "                         (default: BatchThumbnailMinWaitMs=15)\n"
+                 "  --verbose              print scanning details\n"
+                 "  --no-pause             do not wait for Enter before exiting\n"
+                 "  --help                 show this help\n";
 }
 
-int main() {
-	DWORD PID = Memory::GetPID(L"RobloxPlayerBeta.exe");
-	if (!Memory::AttachToProcess(PID)) {
-		std::cout << "couldnt attach to Roblox!" << std::endl;
-		getchar();
-		return 1;
-	}
-    uintptr_t BaseAddress = Memory::GetModuleBaseAddress(L"RobloxPlayerBeta.exe");
-    std::cout << "PID -> " << std::dec << Memory::ProcessId << std::endl;
-    std::cout << "BaseAddress -> 0x" << std::hex << BaseAddress << std::endl;
-
-	bool FoundMap = false;
-	uintptr_t ScanStart = 0x7000000;
-	uintptr_t ScanEnd = 0x12000000;
-	size_t ChunkSize = 0x1000;
-
-	for (uintptr_t currentOffset = ScanStart; currentOffset < ScanEnd; currentOffset += ChunkSize) {
-		if (FoundMap) {
-			break;
-		}
-        size_t BytesToRead = min(ChunkSize, ScanEnd - currentOffset);
-        std::vector<uint8_t> buffer(BytesToRead);
-        if (!Memory::read_batch(BaseAddress + currentOffset, buffer.data(), BytesToRead)) {
-            continue;
-        }
-
-        uintptr_t* Data = reinterpret_cast<uintptr_t*>(buffer.data());
-        size_t AmountOfPointers = BytesToRead / sizeof(uintptr_t);
-
-        for (size_t i = 0; i < AmountOfPointers; i++) {
-            uintptr_t MaybeMap = Data[i];
-
-            if (!MaybeMap || MaybeMap < 0x100000)
-                continue;
-
-            uintptr_t IsThisReallyAMapValidation = Memory::read<uintptr_t>(MaybeMap);
-            if (!IsThisReallyAMapValidation || IsThisReallyAMapValidation < 0x10000)
-                continue;
-
-            if (IsThisReallyAMapValidation == 0x3F800000) {
-                uintptr_t Wow = currentOffset + (i * sizeof(uintptr_t));
-                std::cout << "Potential map found at offset: " << std::hex << Wow << std::endl;
-
-                // Yes this is a Map
-                uintptr_t MapStart = Memory::read<uintptr_t>(MaybeMap + 0x8);
-				uintptr_t MapEnd = Memory::read<uintptr_t>(MapStart + 0x8);
-                uintptr_t Current = Memory::read<uintptr_t>(MapStart);
-
-                if (MapStart < 0x10000 || MapStart > 0x00007FFFFFFFFFFF) {
-                    std::cout << "MapStart failed! -> 0x" << std::hex << MapStart << std::endl;
-                    continue;
-                }
-
-                if (Current < 0x10000 || Current > 0x00007FFFFFFFFFFF) {
-                    std::cout << "Current (1) failed! -> 0x" << std::hex << Current << std::endl;
-                    continue;
-                }
-
-                while (Current != 0 && Current != MapEnd) {
-                    std::string Name = Memory::ReadString(Current + 0x10);
-                    if (Name == "BatchThumbnailMinWaitMs") {
-                        std::cout << "BatchThumbnailMinWaitMs Found." << std::endl;
-						for (uintptr_t TestValueGetSet = 0x20; TestValueGetSet <= 0x100; TestValueGetSet += 0x8) {
-							uintptr_t ValueGetSet = Memory::read<uintptr_t>(Current + TestValueGetSet);
-							for (uintptr_t PointerToValueOffset = 0x0; PointerToValueOffset < 0x300; PointerToValueOffset = PointerToValueOffset + 0x8) {
-								uintptr_t PointerToValue = Memory::read<uintptr_t>(ValueGetSet + PointerToValueOffset);
-								int Value = Memory::read<int>(PointerToValue);
-								if (Value == 15) {
-									FoundMap = true;
-									offsets::FFlagList = Wow;
-									offsets::FlagToValue = PointerToValueOffset;
-									offsets::ValueGetSet = TestValueGetSet;
-									goto FlagOffsetFound;
-								}
-							}
-						}
-
-                        std::cout << "Give up in life, you are a failure." << std::endl;
-                        getchar();
-                    }
-
-                    uintptr_t NewCurrent = Memory::read<uintptr_t>(Current);
-                    if (NewCurrent < 0x10000 || NewCurrent > 0x00007FFFFFFFFFFF) {
-                        std::cout << "Current (2) failed! -> 0x" << std::hex << Current << std::endl;
-                        break;
-                    }
-                    if (Current == NewCurrent) {
-                        break;
-                    }
-                    Current = NewCurrent;
-                }
+bool ParseArgs(int argc, char** argv, Options& options) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string_view arg = argv[i];
+        const auto needValue = [&](std::string_view flag) -> const char* {
+            if (i + 1 >= argc) {
+                std::cerr << "Missing value for " << flag << '\n';
+                return nullptr;
             }
+            return argv[++i];
+        };
+
+        if (arg == "--help" || arg == "-h") {
+            options.help = true;
+        } else if (arg == "--verbose") {
+            options.scan.verbose = true;
+        } else if (arg == "--no-pause") {
+            options.pause = false;
+        } else if (arg == "--out") {
+            const char* value = needValue(arg);
+            if (!value) return false;
+            options.outDir = value;
+        } else if (arg == "--process") {
+            const char* value = needValue(arg);
+            if (!value) return false;
+            options.process = value;
+        } else if (arg == "--anchor") {
+            const char* value = needValue(arg);
+            if (!value) return false;
+            const std::string_view text = value;
+            const auto eq = text.find('=');
+            if (eq == std::string_view::npos || eq == 0) {
+                std::cerr << "--anchor expects Name=Value\n";
+                return false;
+            }
+            const std::string_view number = text.substr(eq + 1);
+            int parsed = 0;
+            const auto [end, ec] = std::from_chars(number.data(), number.data() + number.size(), parsed);
+            if (ec != std::errc{} || end != number.data() + number.size()) {
+                std::cerr << "--anchor value must be an integer\n";
+                return false;
+            }
+            options.scan.anchorName = std::string(text.substr(0, eq));
+            options.scan.anchorValue = parsed;
+        } else {
+            std::cerr << "Unknown argument: " << arg << '\n';
+            return false;
         }
     }
+    return true;
+}
 
-    if (!FoundMap) {
-        std::cout << "FFlag Map not found in scan range." << std::endl;
-        getchar();
-        return 1;
+int Finish(int code, bool pause) {
+    if (pause) {
+        std::cout << "\nPress Enter to exit...";
+        std::cin.get();
+    }
+    return code;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    Options options;
+    if (!ParseArgs(argc, argv, options)) {
+        PrintUsage();
+        return kBadUsage;
+    }
+    if (options.help) {
+        PrintUsage();
+        return kOk;
     }
 
-FlagOffsetFound:
-	std::cout << "Map @ 0x" <<  std::hex << offsets::FFlagList << std::endl;
-	std::cout << "ValueGetSet -> 0x" << std::hex << offsets::ValueGetSet << std::endl;
-	std::cout << "FlagToValue -> 0x" << std::hex << offsets::FlagToValue << std::endl;
+    // --- attach ------------------------------------------------------------
+    const std::wstring processName(options.process.begin(), options.process.end());
+    const DWORD pid = Memory::FindProcessId(processName);
+    Memory::Process process;
+    if (pid == 0 || !process.Attach(pid)) {
+        std::cerr << "Could not attach to " << options.process
+                  << (pid == 0 ? " (process not running)" : " (access denied? try an elevated prompt)") << '\n';
+        return Finish(kAttachFailed, options.pause);
+    }
 
-	// HELL YEA BABY LETS DUMP THE FFLAGS!!! //
-	uintptr_t FFlagPointer1 = Memory::read<uintptr_t>(BaseAddress + offsets::FFlagList);
-	uintptr_t FFlagList = Memory::read<uintptr_t>(FFlagPointer1 + 0x8);
+    const auto module = process.FindModule(processName);
+    if (!module) {
+        std::cerr << "Could not find the main module of " << options.process << '\n';
+        return Finish(kAttachFailed, options.pause);
+    }
+    std::cout << "PID        : " << std::dec << process.Pid() << '\n'
+              << "Base       : " << Memory::ToHex(module->base) << '\n'
+              << "Image size : " << Memory::ToHex(module->size) << '\n';
 
-	uintptr_t Last = Memory::read<uintptr_t>(FFlagList + 0x8);
-	uintptr_t Current = FFlagList;
+    // --- calibrate ---------------------------------------------------------
+    std::cout << "Scanning for the FFlag map (anchor " << options.scan.anchorName << " = "
+              << options.scan.anchorValue << ")...\n";
+    Scanner::LayoutFinder finder(process, *module, options.scan);
+    const auto layout = finder.Find();
+    if (!layout) {
+        std::cerr << "FFlag map not found. If Roblox changed the anchor flag's value, "
+                     "pass a new one with --anchor Name=Value (see --verbose).\n";
+        return Finish(kMapNotFound, options.pause);
+    }
+    std::cout << "Map slot    : " << Memory::ToHex(layout->mapGlobalRva) << '\n'
+              << "ValueGetSet : " << Memory::ToHex(layout->valueGetSet) << '\n'
+              << "FlagToValue : " << Memory::ToHex(layout->flagToValue) << '\n';
 
-	bool FirstJsonEntry = true;
-	std::ofstream outhpp("FFlags.hpp");
-	std::ofstream outjson("FFlags.json");
+    // --- dump --------------------------------------------------------------
+    const auto dump = Scanner::DumpFlags(process, *module, *layout, options.scan);
+    if (!dump || dump->flags.empty()) {
+        std::cerr << "Failed to walk the FFlag list.\n";
+        return Finish(kDumpFailed, options.pause);
+    }
 
-	// JSON //
-	outjson << "{\n";
-	outjson << "    \"FFlagOffsets\": {\n";
-	outjson << "        \"FFlagList\": \"0x" << std::uppercase << std::hex << offsets::FFlagList << "\",\n";
-	outjson << "        \"ValueGetSet\": \"0x" << std::uppercase << std::hex << offsets::ValueGetSet << "\",\n"; 
-	outjson << "        \"FlagToValue\": \"0x" << std::uppercase << std::hex << offsets::FlagToValue << "\"\n";
-	outjson << "    },\n";
-	outjson << "    \"FFlags\": {\n";
-	// JSON //
+    Output::Meta meta;
+    meta.process = options.process;
+    meta.generatedUtc = Output::UtcTimestamp();
+    meta.imageSize = module->size;
+    if (const auto path = process.ImagePath()) meta.robloxVersion = Output::QueryFileVersion(*path);
 
-	// hpp //
-	outhpp << "#pragma once\n\n";
-	outhpp << "namespace FFlagOffsets\n{\n";
-	outhpp << "    uintptr_t FFlagList" << " = 0x" << std::uppercase << std::hex << offsets::FFlagList << ";\n";
-	outhpp << "    uintptr_t ValueGetSet" << " = 0x" << std::uppercase << std::hex << offsets::ValueGetSet << ";\n";
-	outhpp << "    uintptr_t FlagToValue" << " = 0x" << std::uppercase << std::hex << offsets::FlagToValue << ";\n";
-	outhpp << "}\n\n";
-	outhpp << "namespace FFlags\n{\n";
-	// hpp //
-	
-	// FFlag Dumping
-	while (Current != 0 && Current != Last)
-	{
-		std::string Name = Memory::ReadString(Current + 0x10);
-		uintptr_t ValueGetSet = Memory::read<uintptr_t>(Current + offsets::ValueGetSet);
+    std::error_code ec;
+    std::filesystem::create_directories(options.outDir, ec);
+    const auto jsonPath = options.outDir / "FFlags.json";
+    const auto headerPath = options.outDir / "FFlags.hpp";
+    if (!Output::WriteJson(jsonPath, meta, *layout, *dump) ||
+        !Output::WriteHeader(headerPath, meta, *layout, *dump)) {
+        std::cerr << "Could not write output files into " << options.outDir.string() << '\n';
+        return Finish(kDumpFailed, options.pause);
+    }
 
-		if (ValueGetSet < 0x10000 || ValueGetSet > 0x00007FFFFFFFFFFF) {
-			Current = Memory::read<uintptr_t>(Current);
-			continue;
-		}
+    const auto& s = dump->stats;
+    std::cout << "\nDumped " << s.dumped << " flags (" << meta.robloxVersion << ") -> "
+              << jsonPath.string() << ", " << headerPath.string() << '\n'
+              << "Nodes visited: " << s.nodes << " | skipped: bad name " << s.badName << ", bad pointer "
+              << s.badPointer << ", string-valued " << s.stringValued << ", duplicates " << s.duplicates << '\n';
+    if (s.truncated) std::cout << "Warning: node limit reached - the list may be incomplete.\n";
 
-		std::string mhm = Memory::ReadString(ValueGetSet + offsets::FlagToValue); 
-
-		if (mhm == "True" || mhm == "False")
-		{
-			// gg
-		}
-		else
-		{
-			uintptr_t offset = Memory::read<uintptr_t>(ValueGetSet + offsets::FlagToValue) - BaseAddress;
-
-			if (offset < 0x10000 || offset > 0x00007FFFFFFFFFFF) {
-				Current = Memory::read<uintptr_t>(Current);
-				continue;
-			}
-
-			for (auto& c : Name)
-			{
-				if (!isalnum(static_cast<unsigned char>(c)))
-					c = '_';
-			}
-			outhpp << "    uintptr_t " << Name << " = 0x" << std::uppercase << std::hex << offset << ";\n";
-
-			// json shit
-			if (!FirstJsonEntry)
-				outjson << ",\n";
-			else
-				FirstJsonEntry = false;
-
-			outjson << "        \"" << Name << "\": \"0x" << std::uppercase << std::hex << offset << "\"";
-		}
-
-		Current = Memory::read<uintptr_t>(Current);
-	}
-
-	outjson << "\n    }\n";
-	outjson << "}";
-	outjson.close();
-
-	outhpp << "}";
-	outhpp.close();
-
-	std::cout << "--------------------------------------------------------" << std::endl;
-	std::cout << "--------------------------------------------------------" << std::endl;
-	std::cout << "--------------------------------------------------------" << std::endl;
-	std::cout << "--------------------------------------------------------" << std::endl;
-	if (FoundMap) {
-		std::cout << "FFlags dumped successfully." << std::endl;
-	}
-	else {
-		std::cout << "Failed to dump FFlags." << std::endl;
-	}
-	system("pause");
-	return 0;
+    return Finish(kOk, options.pause);
 }
