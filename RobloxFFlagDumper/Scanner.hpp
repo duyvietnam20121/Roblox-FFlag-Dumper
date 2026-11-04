@@ -6,8 +6,8 @@
 //   FindLayout():
 //     for range in [legacy .data range, every writable non-exec PE section]:
 //       for each 8-byte slot in range:
-//         p = *slot                       -> must look like an aligned user pointer
-//         if *p != 0x3F800000 (1.0f)      -> not an unordered_map object, skip
+//         p = *slot                       -> must look like a (4-byte aligned) user pointer
+//         if low dword of *p != 0x3F800000 (1.0f) -> not an unordered_map object, skip
 //         head  = *(p + 8)                -> list sentinel
 //         node  = *head                   -> first element
 //         walk the list; every node whose name is one of the anchors ("BatchThumbnailMinWaitMs", ...)
@@ -39,7 +39,7 @@
 namespace Scanner {
 
 // --- Roblox-specific layout constants (x64) --------------------------------
-inline constexpr std::uintptr_t kLoadFactorSignature = 0x3F800000;  // float 1.0f
+inline constexpr std::uint32_t kLoadFactorSignature = 0x3F800000;   // float 1.0f (low dword; padding may be garbage)
 inline constexpr std::uintptr_t kMapHeadOffset = 0x8;               // list sentinel
 inline constexpr std::uintptr_t kMapSizeOffset = 0x10;             // element count (MSVC _List._Mysize)
 inline constexpr std::uintptr_t kNodeNameOffset = 0x10;             // std::string in node
@@ -103,6 +103,14 @@ struct DumpStats {
 struct DumpResult {
     std::map<std::string, std::uintptr_t> flags;  // name -> RVA, sorted => stable diffs
     DumpStats stats;
+};
+
+// What the scan saw - printed when no map is found, to tell *why*.
+struct ScanStats {
+    std::uint64_t bytesRead = 0;
+    std::uint64_t bytesUnreadable = 0;
+    std::uint64_t pointersTested = 0;  // distinct pointer-like values dereferenced
+    std::uint64_t signatureHits = 0;   // ...whose target starts with 1.0f
 };
 
 // What the verification measured for the accepted layout (printed by main).
@@ -219,6 +227,9 @@ public:
     LayoutFinder(const Memory::Process& process, const Memory::ModuleInfo& module, const Config& config)
         : process_(process), module_(module), config_(config) {}
 
+    // Counters of the scan so far (see ScanStats).
+    [[nodiscard]] const ScanStats& ScanStatistics() const noexcept { return scanStats_; }
+
     // Measurements of the last accepted layout (performed == false if verification was off).
     [[nodiscard]] const VerifyInfo& Verification() const noexcept { return info_; }
 
@@ -234,7 +245,11 @@ public:
 
         // 2) Fallback: every writable data section of the image.
         if (config_.verbose) std::cout << "[scan] legacy range failed, trying PE data sections\n";
-        for (const Range& range : ReadDataSections(process_, module_)) {
+        const auto sections = ReadDataSections(process_, module_);
+        if (config_.verbose) std::cout << "[scan] " << sections.size() << " writable data section(s) found\n";
+        for (const Range& range : sections) {
+            if (config_.verbose)
+                std::cout << "[scan] section RVA " << Memory::ToHex(range.start) << " - " << Memory::ToHex(range.end) << '\n';
             if (auto layout = ScanRange(range)) return layout;
         }
         return std::nullopt;
@@ -251,6 +266,7 @@ private:
             if (bytes == 0) break;
 
             if (process_.ReadBytes(module_.base + offset, buffer.data(), bytes)) {
+                scanStats_.bytesRead += bytes;
                 if (auto layout = ScanBlock(buffer.data(), bytes / sizeof(std::uintptr_t), offset)) return layout;
                 continue;
             }
@@ -258,7 +274,11 @@ private:
             // The chunk contains unreadable pages: retry page by page.
             for (std::size_t page = 0; page < bytes; page += kPageSize) {
                 const std::size_t n = std::min(kPageSize, bytes - page);
-                if (!process_.ReadBytes(module_.base + offset + page, buffer.data(), n)) continue;
+                if (!process_.ReadBytes(module_.base + offset + page, buffer.data(), n)) {
+                    scanStats_.bytesUnreadable += n;
+                    continue;
+                }
+                scanStats_.bytesRead += n;
                 if (auto layout = ScanBlock(buffer.data(), n / sizeof(std::uintptr_t), offset + page))
                     return layout;
             }
@@ -269,11 +289,13 @@ private:
     std::optional<Layout> ScanBlock(const std::uintptr_t* slots, std::size_t count, std::uintptr_t blockRva) {
         for (std::size_t i = 0; i < count; ++i) {
             const std::uintptr_t candidate = slots[i];
-            if (candidate < kMinMapPointer || !Memory::IsUserPointer(candidate) || (candidate & 7)) continue;
+            if (candidate < kMinMapPointer || !Memory::IsUserPointer(candidate) || (candidate & 3)) continue;
             if (!checked_.insert(candidate).second) continue;  // already validated
+            ++scanStats_.pointersTested;
 
-            const auto signature = process_.Read<std::uintptr_t>(candidate);
+            const auto signature = process_.Read<std::uint32_t>(candidate);
             if (!signature || *signature != kLoadFactorSignature) continue;
+            ++scanStats_.signatureHits;
 
             const std::uintptr_t slotRva = blockRva + i * sizeof(std::uintptr_t);
             if (config_.verbose) std::cout << "[scan] map candidate, slot RVA " << Memory::ToHex(slotRva) << '\n';
@@ -414,6 +436,7 @@ private:
     std::unordered_set<std::uintptr_t> checked_;
     std::vector<std::string> report_;
     VerifyInfo info_;
+    ScanStats scanStats_;
 };
 
 }  // namespace Scanner

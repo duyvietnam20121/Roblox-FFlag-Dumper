@@ -186,6 +186,14 @@ int main(int argc, char** argv) {
             for (const auto& line : finder.LastRejection()) std::cerr << "  - " << line << '\n';
             std::cerr << "(use --no-verify to accept it anyway)\n\n";
         }
+        const auto& st = finder.ScanStatistics();
+        std::cerr << "Scan summary: read " << st.bytesRead / 1048576 << " MB (" << st.bytesUnreadable / 1048576
+                  << " MB unreadable), " << st.pointersTested << " pointers tested, " << st.signatureHits
+                  << " targets start with 1.0f (unordered_map signature)\n";
+        if (st.bytesRead == 0)
+            std::cerr << "-> No memory of the process could be read (permissions or protection).\n";
+        else if (st.signatureHits == 0)
+            std::cerr << "-> No unordered_map-like object found: the structure may have changed in this Roblox version.\n";
         std::cerr << "FFlag map not found. If Roblox changed a landmark's value, pass new ones with "
                      "--anchor Name=Value (repeatable, see --verbose).\n";
         return Finish(kMapNotFound, options.pause);
