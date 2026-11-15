@@ -27,6 +27,7 @@
 // ---------------------------------------------------------------------------
 
 #include <algorithm>
+#include <cstdio>
 #include <iostream>
 #include <map>
 #include <optional>
@@ -35,6 +36,7 @@
 #include <vector>
 
 #include "Memory.hpp"
+#include "MemoryScan.hpp"
 
 namespace Scanner {
 
@@ -69,6 +71,7 @@ struct Config {
     // locate the layout and one matching value is enough, so a Roblox update that changes one
     // default does not break the tool. Landmarks given with --anchor are strict (RequiredMatches).
     bool defaultAnchors = true;
+    bool discover = true;                                // name-based fallback (--no-discover)
     bool verify = true;                                  // --no-verify disables the checks
     double minCoverage = 0.5;                            // share of usable entries required
     double minUniqueRvas = 0.8;                          // share of distinct value addresses required
@@ -81,13 +84,75 @@ struct Config {
 
 struct Layout {
     std::uintptr_t mapGlobalRva = 0;  // RVA of the global slot holding the map pointer
+                                      // (or of the map object itself when mapEmbedded)
     std::uintptr_t valueGetSet = 0;   // node offset -> ValueGetSet object
     std::uintptr_t flagToValue = 0;   // ValueGetSet offset -> pointer to the value
+    bool mapEmbedded = false;         // true: the map object lives directly in the module's data
 };
 
 struct Range {
     std::uintptr_t start = 0;  // RVA
     std::uintptr_t end = 0;    // RVA (exclusive)
+};
+
+// Address of the map object for a layout (direct, or through the global slot).
+[[nodiscard]] inline std::optional<std::uintptr_t> ResolveMapObject(const Memory::Process& process,
+                                                                    const Memory::ModuleInfo& module,
+                                                                    const Layout& layout) {
+    if (layout.mapEmbedded) return module.base + layout.mapGlobalRva;
+    return process.Read<std::uintptr_t>(module.base + layout.mapGlobalRva);
+}
+
+struct Offsets {
+    std::uintptr_t valueGetSet = 0;
+    std::uintptr_t flagToValue = 0;
+};
+
+// Brute-forces the two offsets so that the node's value pointer leads to `expected`.
+[[nodiscard]] inline std::optional<Offsets> ProbeOffsets(const Memory::Process& process, std::uintptr_t node,
+                                                         int expected) {
+    for (std::uintptr_t getSet = 0x20; getSet <= 0x100; getSet += 8) {
+        const auto object = process.Read<std::uintptr_t>(node + getSet);
+        if (!object || !Memory::IsUserPointer(*object)) continue;
+
+        for (std::uintptr_t toValue = 0; toValue < 0x300; toValue += 8) {
+            const auto pointer = process.Read<std::uintptr_t>(*object + toValue);
+            if (!pointer || !Memory::IsUserPointer(*pointer)) continue;
+
+            const auto value = process.Read<int>(*pointer);
+            if (value && *value == expected) return Offsets{getSet, toValue};
+        }
+    }
+    return std::nullopt;
+}
+
+// Hex dump of `size` bytes at `address` (16 per line), for diagnostics.
+[[nodiscard]] inline std::string HexDump(const Memory::Process& process, std::uintptr_t address, std::size_t size) {
+    std::vector<std::uint8_t> bytes(size);
+    if (!process.ReadBytes(address, bytes.data(), size)) return "  (unreadable)\n";
+    std::string out;
+    char line[16];
+    for (std::size_t i = 0; i < size; i += 16) {
+        out += "  " + Memory::ToHex(address + i) + ":";
+        for (std::size_t j = i; j < std::min(size, i + 16); ++j) {
+            std::snprintf(line, sizeof(line), " %02x", bytes[j]);
+            out += line;
+        }
+        out += '\n';
+    }
+    return out;
+}
+
+// What the name-based discovery fallback saw - printed when it fails, to tell *why*.
+struct DiscoveryStats {
+    bool attempted = false;
+    std::size_t nameHits = 0;        // places where the landmark's name text exists
+    std::size_t references = 0;      // pointers to that text
+    std::size_t nodes = 0;           // ...that sit in a valid list node
+    std::size_t circularLists = 0;   // ...whose list is circular and has a sentinel
+    std::size_t mapObjects = 0;      // ...with a map object whose size field matches
+    std::size_t probeFailed = 0;     // layouts whose landmark value could not be reached
+    std::string firstReferenceDump;  // memory around the first reference (if no node matched)
 };
 
 struct DumpStats {
@@ -166,7 +231,7 @@ struct VerifyInfo {
 [[nodiscard]] inline std::optional<DumpResult> DumpFlags(const Memory::Process& process,
                                                          const Memory::ModuleInfo& module,
                                                          const Layout& layout, const Config& config) {
-    const auto mapObject = process.Read<std::uintptr_t>(module.base + layout.mapGlobalRva);
+    const auto mapObject = ResolveMapObject(process, module, layout);
     if (!mapObject || !Memory::IsUserPointer(*mapObject)) return std::nullopt;
 
     const auto head = process.Read<std::uintptr_t>(*mapObject + kMapHeadOffset);
@@ -227,6 +292,9 @@ public:
     LayoutFinder(const Memory::Process& process, const Memory::ModuleInfo& module, const Config& config)
         : process_(process), module_(module), config_(config) {}
 
+    // What the name-based fallback saw (attempted == false if it never ran).
+    [[nodiscard]] const DiscoveryStats& DiscoveryStatistics() const noexcept { return discovery_; }
+
     // Counters of the scan so far (see ScanStats).
     [[nodiscard]] const ScanStats& ScanStatistics() const noexcept { return scanStats_; }
 
@@ -252,10 +320,107 @@ public:
                 std::cout << "[scan] section RVA " << Memory::ToHex(range.start) << " - " << Memory::ToHex(range.end) << '\n';
             if (auto layout = ScanRange(range)) return layout;
         }
+
+        // 3) Signature-free fallback: locate the map through the landmark flags' names.
+        if (config_.discover) return Discover();
         return std::nullopt;
     }
 
 private:
+    // ---- name-based discovery ------------------------------------------------------------
+    // Needs no structure signature. Landmark name text -> pointer to it (node + 0x10) -> circular list
+    // -> sentinel -> map object (sentinel at +0x08, element count at +0x10) -> global slot in the module.
+    std::optional<Layout> Discover() {
+        discovery_.attempted = true;
+        std::cout << "Signature scan found nothing - searching the process memory by flag name (can take a while)...\n";
+
+        const auto regions = process_.ReadableRegions();
+        const auto moduleRegions = MemoryScan::Clip(regions, module_.base, module_.size);
+
+        for (const Anchor& anchor : config_.anchors) {
+            std::string pattern = anchor.name;
+            pattern.push_back('\0');
+            const auto texts = MemoryScan::FindBytes(process_, regions, pattern, 64);
+            discovery_.nameHits += texts.size();
+            if (config_.verbose)
+                std::cout << "[discover] '" << anchor.name << "': " << texts.size() << " text hit(s)\n";
+
+            // Candidate nodes: names >= 16 chars live on the heap (node+0x10 points to the text),
+            // shorter names are stored inline at node+0x10.
+            std::vector<std::uintptr_t> nodes;
+            if (anchor.name.size() < 16) {
+                for (const auto text : texts)
+                    if (text >= kNodeNameOffset) nodes.push_back(text - kNodeNameOffset);
+            } else {
+                const auto refs = MemoryScan::FindPointers(process_, regions, texts, 256);
+                discovery_.references += refs.size();
+                if (discovery_.firstReferenceDump.empty() && !refs.empty() && refs.front().first >= 0x40)
+                    discovery_.firstReferenceDump = HexDump(process_, refs.front().first - 0x40, 0xA0);
+                for (const auto& ref : refs)
+                    if (ref.first >= kNodeNameOffset) nodes.push_back(ref.first - kNodeNameOffset);
+            }
+
+            for (const std::uintptr_t node : nodes) {
+                if (auto layout = DiscoverFromNode(node, anchor, regions, moduleRegions)) return layout;
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::optional<Layout> DiscoverFromNode(std::uintptr_t node, const Anchor& anchor,
+                                           const std::vector<Memory::Region>& regions,
+                                           const std::vector<Memory::Region>& moduleRegions) {
+        // 1) the node must really carry the landmark's name
+        const auto name = process_.ReadMsvcString(node + kNodeNameOffset);
+        if (!name || *name != anchor.name) return std::nullopt;
+        ++discovery_.nodes;
+
+        // 2) walk the circular list; nodes without a valid name are sentinel candidates
+        std::vector<std::uintptr_t> sentinels;
+        std::size_t length = 0;
+        std::uintptr_t current = node;
+        do {
+            const auto next = process_.Read<std::uintptr_t>(current);
+            if (!next || !Memory::IsUserPointer(*next) || ++length > config_.maxListNodes) return std::nullopt;
+            if (sentinels.size() < 4 && !process_.ReadMsvcString(*next + kNodeNameOffset)) sentinels.push_back(*next);
+            current = *next;
+        } while (current != node);
+        if (sentinels.empty()) return std::nullopt;
+        ++discovery_.circularLists;
+
+        // 3) the map object stores the sentinel at +0x08 and the element count at +0x10
+        const auto probe = ProbeOffsets(process_, node, anchor.value);
+        for (const std::uintptr_t sentinel : sentinels) {
+            for (const auto& head : MemoryScan::FindPointers(process_, regions, {sentinel}, 64)) {
+                if (head.first < kMapHeadOffset) continue;
+                const std::uintptr_t mapObject = head.first - kMapHeadOffset;
+                const auto declared = process_.Read<std::uint64_t>(mapObject + kMapSizeOffset);
+                if (!declared || *declared != length - 1) continue;
+                ++discovery_.mapObjects;
+                if (!probe) {
+                    ++discovery_.probeFailed;
+                    continue;
+                }
+
+                // 4a) a global slot in the module points at the map object
+                for (const auto& slot : MemoryScan::FindPointers(process_, moduleRegions, {mapObject}, 8)) {
+                    const Layout layout{slot.first - module_.base, probe->valueGetSet, probe->flagToValue, false};
+                    if (config_.verbose)
+                        std::cout << "[discover] map via slot RVA " << Memory::ToHex(layout.mapGlobalRva) << '\n';
+                    if (Verify(layout)) return layout;
+                }
+                // 4b) the map object itself lies inside the module (no pointer to it)
+                if (mapObject >= module_.base && mapObject < module_.base + module_.size) {
+                    const Layout layout{mapObject - module_.base, probe->valueGetSet, probe->flagToValue, true};
+                    if (config_.verbose)
+                        std::cout << "[discover] map embedded at RVA " << Memory::ToHex(layout.mapGlobalRva) << '\n';
+                    if (Verify(layout)) return layout;
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
     std::optional<Layout> ScanRange(const Range& range) {
         const std::size_t chunk = std::max<std::size_t>(config_.chunkSize & ~std::size_t{7}, kPageSize);
         std::vector<std::uintptr_t> buffer(chunk / sizeof(std::uintptr_t));
@@ -340,20 +505,10 @@ private:
         return std::nullopt;
     }
 
-    // Brute-forces the two offsets so that the anchor flag's value is reachable.
+    // Landmark node -> Layout (offsets come from ProbeOffsets).
     std::optional<Layout> ProbeAnchor(std::uintptr_t node, std::uintptr_t slotRva, int expected) const {
-        for (std::uintptr_t getSet = 0x20; getSet <= 0x100; getSet += 8) {
-            const auto object = process_.Read<std::uintptr_t>(node + getSet);
-            if (!object || !Memory::IsUserPointer(*object)) continue;
-
-            for (std::uintptr_t toValue = 0; toValue < 0x300; toValue += 8) {
-                const auto pointer = process_.Read<std::uintptr_t>(*object + toValue);
-                if (!pointer || !Memory::IsUserPointer(*pointer)) continue;
-
-                const auto value = process_.Read<int>(*pointer);
-                if (value && *value == expected) return Layout{slotRva, getSet, toValue};
-            }
-        }
+        if (const auto offsets = ProbeOffsets(process_, node, expected))
+            return Layout{slotRva, offsets->valueGetSet, offsets->flagToValue, false};
         return std::nullopt;
     }
 
@@ -391,7 +546,7 @@ private:
         }
 
         // The map object stores its own element count: compare it with what we walked (soft check).
-        if (const auto mapObject = process_.Read<std::uintptr_t>(module_.base + layout.mapGlobalRva))
+        if (const auto mapObject = ResolveMapObject(process_, module_, layout))
             info.declaredSize = process_.Read<std::uint64_t>(*mapObject + kMapSizeOffset);
         if (info.declaredSize) {
             Note("list size field " + std::to_string(*info.declaredSize) + ", walked " +
@@ -437,6 +592,7 @@ private:
     std::vector<std::string> report_;
     VerifyInfo info_;
     ScanStats scanStats_;
+    DiscoveryStats discovery_;
 };
 
 }  // namespace Scanner

@@ -25,7 +25,7 @@ Start Roblox first, then:
 
 ```
 RobloxFFlagDumper [--out <dir>] [--process <exe>] [--anchor Name=Value]...
-                  [--values] [--no-verify] [--verbose] [--no-pause] [--help]
+                  [--values] [--no-verify] [--no-discover] [--verbose] [--no-pause] [--help]
 ```
 
 | Option | Meaning |
@@ -34,6 +34,7 @@ RobloxFFlagDumper [--out <dir>] [--process <exe>] [--anchor Name=Value]...
 | `--process <exe>` | Target process (default `RobloxPlayerBeta.exe`) |
 | `--anchor Name=Value` | Landmark: an **integer** flag with a known value. Repeatable, **max 4** (`--anchor2` is an alias). See [Landmarks](#landmarks). |
 | `--values` | Also store each flag's current int value in `FFlags.json` (`Values` block) - input for `pick_anchors.py` |
+| `--no-discover` | Skip the name-based fallback (see [How it works](#how-it-works)) |
 | `--no-verify` | Skip layout verification |
 | `--verbose` | Print scanning and verification details |
 | `--no-pause` | Do not wait for Enter at the end (scripts / CI) |
@@ -59,8 +60,14 @@ learns the two structure offsets from where its value lives.
    pointer to an `unordered_map` object (first qword `0x3F800000` = load factor `1.0f`).
 2. Walk its node list; at a node named like a landmark, brute-force the two offsets that lead from the node to
    the landmark's value.
-3. **Verify** the layout (below). A rejected layout makes the scan continue with other candidates.
-4. Walk the whole circular list again and keep every entry whose value pointer lies inside the module image.
+3. **Fallback - name-based discovery** (only if steps 1-2 find nothing, e.g. after Roblox changed the map's
+   internal layout): search the process memory for the landmark's name, follow the pointer to its list node,
+   walk the circular list to the sentinel, find the map object (sentinel at `+0x08`, element count at `+0x10`
+   must equal the list length) and the global slot in the module that points at it. If the map object lies
+   directly in the module, `Embedded = true` is written to the output. This pass reads all readable memory of
+   the process, so it takes a few seconds to a minute. Disable with `--no-discover`.
+4. **Verify** the layout (below). A rejected layout makes the scan continue with other candidates.
+5. Walk the whole circular list again and keep every entry whose value pointer lies inside the module image.
 
 ### Verification
 
@@ -88,6 +95,9 @@ A map was found but its layout was rejected:
   - anchors matched 1/2 (need 2)
 ```
 
+If no map is found at all, the tool prints a scan summary (bytes read, pointers tested, signature hits) and the
+statistics of the name-based search, which tell whether memory was unreadable or the structure changed.
+
 The thresholds (50% / 80%) are empirical; if a correct layout is rejected, run with `--verbose` and
 `--no-verify` and compare.
 
@@ -109,7 +119,7 @@ and prefers uncommon values, since the offset probe matches by value.
 | Block | Content |
 | --- | --- |
 | `Meta` | `Process`, `RobloxVersion` (e.g. `version-5a21b87bbc2641cf`, taken from the install folder name), `GeneratedAt` (UTC date/time), `ImageSize`, `FlagCount` |
-| `FFlagOffsets` | `FFlagList`, `ValueGetSet`, `FlagToValue` |
+| `FFlagOffsets` | `FFlagList`, `ValueGetSet`, `FlagToValue` (+ `FFlagListEmbedded: true` when the map object itself lies in the module) |
 | `FFlags` | flag name -> RVA, sorted by name so two dumps can be compared with a plain `diff` |
 | `Values` | only with `--values`: flag name -> current int value |
 
@@ -148,6 +158,7 @@ RobloxFFlagDumper.sln
 RobloxFFlagDumper/
     main.cpp        CLI, orchestration, exit codes
     Memory.hpp      read-only process access (RAII), MSVC std::string reader
+    MemoryScan.hpp  byte / pointer searches over process memory (name-based fallback)
     Scanner.hpp     layout finder, verification, flag dump
     Output.hpp      FFlags.json / FFlags.hpp writers, version and timestamp
 tools/pick_anchors.py

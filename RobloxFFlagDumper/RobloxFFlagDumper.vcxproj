@@ -130,6 +130,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="Memory.hpp" />
+    <ClInclude Include="MemoryScan.hpp" />
     <ClInclude Include="Output.hpp" />
     <ClInclude Include="Scanner.hpp" />
   </ItemGroup>

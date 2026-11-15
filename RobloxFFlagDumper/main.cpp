@@ -2,7 +2,7 @@
 // RobloxFFlagDumper - dumps FFlag offsets from a running Roblox client.
 //
 // Usage:  RobloxFFlagDumper [--out <dir>] [--process <exe>] [--anchor Name=Value]...
-//                           [--no-verify] [--values]
+//                           [--no-verify] [--no-discover] [--values]
 //                           [--verbose] [--no-pause] [--help]
 //
 // Exit codes: 0 ok | 1 cannot attach | 2 map not found | 3 dump/IO failure | 64 bad usage
@@ -44,6 +44,7 @@ void PrintUsage() {
                  "                         (default: BatchThumbnailMinWaitMs=15)\n"
                  "  --values               also store each flag's current int value in FFlags.json\n"
                  "                         (feed several dumps to pick_anchors.py to find stable anchors)\n"
+                 "  --no-discover          skip the name-based fallback (slow search of all process memory)\n"
                  "  --no-verify            skip the layout verification (coverage + landmark check)\n"
                  "  --verbose              print scanning details\n"
                  "  --no-pause             do not wait for Enter before exiting\n"
@@ -111,6 +112,8 @@ bool ParseArgs(int argc, char** argv, Options& options) {
             options.scan.anchors.push_back(std::move(anchor));
         } else if (arg == "--values") {
             options.values = true;
+        } else if (arg == "--no-discover") {
+            options.scan.discover = false;
         } else if (arg == "--no-verify") {
             options.scan.verify = false;
         } else {
@@ -194,11 +197,21 @@ int main(int argc, char** argv) {
             std::cerr << "-> No memory of the process could be read (permissions or protection).\n";
         else if (st.signatureHits == 0)
             std::cerr << "-> No unordered_map-like object found: the structure may have changed in this Roblox version.\n";
+        const auto& d = finder.DiscoveryStatistics();
+        if (d.attempted) {
+            std::cerr << "Name-based search: " << d.nameHits << " text hit(s), " << d.references << " pointer(s) to it, "
+                      << d.nodes << " valid node(s), " << d.circularLists << " circular list(s), " << d.mapObjects
+                      << " map object(s)" << (d.probeFailed ? ", landmark value unreachable in " + std::to_string(d.probeFailed) : std::string())
+                      << "\n";
+            if (d.nodes == 0 && !d.firstReferenceDump.empty())
+                std::cerr << "Memory around the first pointer to the landmark's name (send this if it keeps failing):\n"
+                          << d.firstReferenceDump;
+        }
         std::cerr << "FFlag map not found. If Roblox changed a landmark's value, pass new ones with "
                      "--anchor Name=Value (repeatable, see --verbose).\n";
         return Finish(kMapNotFound, options.pause);
     }
-    std::cout << "Map slot    : " << Memory::ToHex(layout->mapGlobalRva) << '\n'
+    std::cout << (layout->mapEmbedded ? "Map object  : " : "Map slot    : ") << Memory::ToHex(layout->mapGlobalRva) << '\n'
               << "ValueGetSet : " << Memory::ToHex(layout->valueGetSet) << '\n'
               << "FlagToValue : " << Memory::ToHex(layout->flagToValue) << '\n';
 

@@ -103,7 +103,8 @@ struct Meta {
         << "    \"FFlagOffsets\": {\n"
         << "        \"FFlagList\": \"" << Memory::ToHex(layout.mapGlobalRva) << "\",\n"
         << "        \"ValueGetSet\": \"" << Memory::ToHex(layout.valueGetSet) << "\",\n"
-        << "        \"FlagToValue\": \"" << Memory::ToHex(layout.flagToValue) << "\"\n"
+        << "        \"FlagToValue\": \"" << Memory::ToHex(layout.flagToValue) << "\""
+        << (layout.mapEmbedded ? ",\n        \"FFlagListEmbedded\": true" : "") << "\n"
         << "    },\n"
         << "    \"FFlags\": {\n";
 
@@ -145,6 +146,7 @@ struct Meta {
         << "        inline constexpr std::uintptr_t Pointer = " << hex(layout.mapGlobalRva) << ";\n"
         << "        inline constexpr std::uintptr_t ToFlag = " << hex(layout.valueGetSet) << ";\n"
         << "        inline constexpr std::uintptr_t ToValue = " << hex(layout.flagToValue) << ";\n"
+        << (layout.mapEmbedded ? "        inline constexpr bool Embedded = true;  // Pointer is the map object itself\n" : "")
         << "    }\n\n"
         << "    namespace FFlags {\n";
 

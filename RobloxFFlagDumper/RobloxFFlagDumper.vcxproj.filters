@@ -12,6 +12,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Memory.hpp"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="MemoryScan.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="Output.hpp"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="Scanner.hpp"><Filter>Header Files</Filter></ClInclude>
   </ItemGroup>

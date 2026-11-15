@@ -27,6 +27,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 namespace Memory {
 
@@ -48,6 +49,12 @@ inline constexpr std::uintptr_t kMaxUserPointer = 0x00007FFFFFFFFFFFull;
 struct ModuleInfo {
     std::uintptr_t base = 0;
     std::size_t size = 0;  // SizeOfImage
+};
+
+// A committed, readable block of the target's address space.
+struct Region {
+    std::uintptr_t base = 0;
+    std::size_t size = 0;
 };
 
 // Case-insensitive lookup of a process id by executable name. 0 = not found.
@@ -108,6 +115,27 @@ public:
         T value{};
         if (ReadBytes(address, &value, sizeof(T))) return value;
         return std::nullopt;
+    }
+
+    // Every committed, readable region of the target (heap, stacks, images, ...).
+    [[nodiscard]] std::vector<Region> ReadableRegions() const {
+        constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
+                                    PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+        std::vector<Region> regions;
+        if (!handle_) return regions;
+
+        std::uintptr_t address = 0;
+        MEMORY_BASIC_INFORMATION info{};
+        while (address <= kMaxUserPointer &&
+               VirtualQueryEx(handle_, reinterpret_cast<LPCVOID>(address), &info, sizeof(info)) == sizeof(info)) {
+            const auto base = reinterpret_cast<std::uintptr_t>(info.BaseAddress);
+            if (info.State == MEM_COMMIT && (info.Protect & kReadable) && !(info.Protect & (PAGE_GUARD | PAGE_NOACCESS)))
+                regions.push_back({base, static_cast<std::size_t>(info.RegionSize)});
+            const std::uintptr_t next = base + info.RegionSize;
+            if (next <= address) break;
+            address = next;
+        }
+        return regions;
     }
 
     // Module (e.g. the main exe) base address and image size.
