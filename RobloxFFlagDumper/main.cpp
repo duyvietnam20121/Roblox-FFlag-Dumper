@@ -50,7 +50,7 @@ void PrintUsage() {
                  "  --values               also store each flag's current int value in FFlags.json\n"
                  "                         (feed several dumps to pick_anchors.py to find stable anchors)\n"
                  "  --dump-skipped         also write FFlagsSkipped.json: every node that was NOT turned into an\n"
-                 "                         offset (string-valued, bad pointer...) with raw data, to analyse them\n"
+                 "                         offset (string-stored, bad pointer...) with raw data, to analyse them\n"
                  "  --inspect <FlagName>   print a hex report of one flag's node and value object (also saved to\n"
                  "                         Inspect_<FlagName>.txt); the F/DF/FInt... prefix is optional\n"
                  "  --no-discover          skip the name-based fallback (slow search of all process memory)\n"
@@ -289,7 +289,7 @@ int main(int argc, char** argv) {
     std::cout << "\nDumped " << s.dumped << " flags (" << meta.robloxVersion << ") -> "
               << jsonPath.string() << ", " << headerPath.string() << '\n'
               << "Nodes visited: " << s.nodes << " | skipped: bad name " << s.badName << ", bad pointer "
-              << s.badPointer << ", string-valued " << s.stringValued << ", duplicates " << s.duplicates << '\n'
+              << s.badPointer << ", string-stored " << s.stringValued << ", duplicates " << s.duplicates << '\n'
               << VerificationSummary(finder.Verification(), options.scan.verify) << '\n';
     if (s.truncated) std::cout << "Warning: node limit reached - the list may be incomplete.\n";
 

@@ -175,6 +175,19 @@ public:
         return buffer;
     }
 
+    // True when the 32 bytes at `address` have the shape of an MSVC x64 std::string: size <= capacity and a
+    // capacity of 15 (inline) or of the form 16k-1 (heap), at most 1 MB. Unlike ReadMsvcString this accepts
+    // empty and very long strings, and does not follow the heap pointer.
+    [[nodiscard]] bool LooksLikeMsvcString(std::uintptr_t address) const {
+        struct Header {
+            std::uint64_t size;
+            std::uint64_t capacity;
+        } header{};
+        if (!ReadBytes(address + 0x10, &header, sizeof(header))) return false;
+        return header.size <= header.capacity && header.capacity >= 15 && header.capacity <= (1u << 20) &&
+               (header.capacity & 0xF) == 0xF;
+    }
+
     // Reads an MSVC x64 std::string located at `address`.
     //
     // Layout: +0x00 inline buffer / heap pointer, +0x10 size, +0x18 capacity.

@@ -168,14 +168,14 @@ struct DumpStats {
 };
 
 // How the dumper classifies one list node.
-enum class NodeStatus { Dumped, BadName, BadObject, StringValue, BadValuePointer };
+enum class NodeStatus { Dumped, BadName, BadObject, StringStored, BadValuePointer };
 
 [[nodiscard]] inline const char* ToString(NodeStatus status) noexcept {
     switch (status) {
         case NodeStatus::Dumped: return "dumped";
         case NodeStatus::BadName: return "bad-name";
         case NodeStatus::BadObject: return "bad-object";
-        case NodeStatus::StringValue: return "string-valued";
+        case NodeStatus::StringStored: return "string-stored";
         case NodeStatus::BadValuePointer: return "bad-value-pointer";
     }
     return "unknown";
@@ -190,6 +190,8 @@ struct SkippedFlag {
     std::uintptr_t valuePointer = 0; // 8 bytes at object + FlagToValue
     std::string text;                // std::string found at object + FlagToValue, if any
     std::string raw;                 // 32 raw bytes (hex) at object + FlagToValue (node + 0x10 for bad-name)
+    std::uintptr_t vtableRva = 0;    // module RVA of the object's first qword (its class), 0 if not in the module
+    std::uint64_t kind = 0;          // 8 bytes at object + 0x10 (type / size tag seen in --inspect)
 };
 
 struct DumpResult {
@@ -283,9 +285,10 @@ struct NodeInfo {
     if (const auto text = process.ReadMsvcString(*object + layout.flagToValue)) info.text = *text;
     if (const auto pointer = process.Read<std::uintptr_t>(*object + layout.flagToValue)) info.valuePointer = *pointer;
 
-    // Entries whose "value" is the text True/False are not offsets.
-    if (info.text == "True" || info.text == "False") {
-        info.status = NodeStatus::StringValue;
+    // Flags that only exist as text (remote / dynamic flags) keep their value as a std::string inside the
+    // object, at object + FlagToValue: the value lives on the heap, so there is no module offset to record.
+    if (process.LooksLikeMsvcString(*object + layout.flagToValue)) {
+        info.status = NodeStatus::StringStored;
         return info;
     }
 
@@ -350,7 +353,7 @@ struct NodeInfo {
             case NodeStatus::BadName: ++stats.badName; break;
             case NodeStatus::BadObject:
             case NodeStatus::BadValuePointer: ++stats.badPointer; break;
-            case NodeStatus::StringValue: ++stats.stringValued; break;
+            case NodeStatus::StringStored: ++stats.stringValued; break;
         }
 
         if (info.status != NodeStatus::Dumped && config.collectSkipped) {
@@ -361,6 +364,12 @@ struct NodeInfo {
             entry.object = info.object;
             entry.valuePointer = info.valuePointer;
             entry.text = info.text;
+            if (info.object) {
+                if (const auto vtable = process.Read<std::uintptr_t>(info.object);
+                    vtable && *vtable >= module.base && *vtable < module.base + module.size)
+                    entry.vtableRva = *vtable - module.base;
+                entry.kind = process.Read<std::uint64_t>(info.object + 0x10).value_or(0);
+            }
             entry.raw = info.status == NodeStatus::BadName ? HexBytes(process, node + kNodeNameOffset, 32)
                         : info.object ? HexBytes(process, info.object + layout.flagToValue, 32)
                                       : std::string();

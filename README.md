@@ -78,7 +78,7 @@ The accepted layout must pass all of these (disable with `--no-verify`):
 
 | Check | What it catches |
 | --- | --- |
-| **Coverage** >= 50% | A wrong layout resolves almost no value pointers into the module image, a right one resolves most. |
+| **Coverage** >= 50% | Among static (non string-stored) entries, a wrong layout resolves almost no value pointers into the module image, a right one resolves nearly all. |
 | **Unique addresses** >= 80% | Every flag owns its storage; a wrong layout tends to point many entries at one address. |
 | **Landmarks** | They must read back their expected value (see [Landmarks](#landmarks)). |
 | **List size** (reported, soft) | Nodes walked vs. the element count stored in the map object itself. A mismatch is shown as a warning. |
@@ -106,19 +106,26 @@ The thresholds (50% / 80%) are empirical; if a correct layout is rejected, run w
 
 ## Skipped flags
 
-About half of the nodes in the map are not written to `FFlags.json`. The dumper only keeps entries whose
-value pointer leads **into the module image**; the rest are skipped with one of these reasons:
+The flag map holds two kinds of entries:
+
+| Kind | Where the value lives | In `FFlags.json`? |
+| --- | --- | --- |
+| **Static flags** | a variable in the module's data section (the value pointer leads into the module image) | yes - its RVA is the offset |
+| **String-stored flags** (remote / dynamic flags such as `EnableLuaAccountSwitchRelease2`) | a `std::string` inside a heap object (`"True"`, `"False"`, `"10000"`, a layer name, ...) | no - the address changes on every run, so there is no module offset to record |
+
+On `version-4ea8e85481e34f46` that was 15290 static flags and 19055 string-stored flags (34345 nodes in total).
+Nodes are reported with one of these reasons:
 
 | Reason | Meaning |
 | --- | --- |
-| `string-valued` | the spot where the value pointer is expected holds the text `True` / `False` (typically bool flags) |
-| `bad-value-pointer` | the pointer there does not lead into the module image |
+| `string-stored` | the value is a `std::string` at `object + ToValue` (text kept in the `Text` field of `FFlagsSkipped.json`) |
+| `bad-value-pointer` | the value pointer does not lead into the module image and is not a string either |
 | `bad-object` | the node has no readable value object |
 | `bad-name` | the node's name is not a valid string |
 
 `--dump-skipped` lists them all with raw data, and `--inspect DebugGraphicsPreferD3D11` shows one flag in detail
-(node bytes, value-object bytes, every field that points into the module and the bytes it points at). Use these
-to find where bool flags keep their value; run `--dump-skipped` and `--inspect` with Roblox fully loaded.
+(node bytes, value-object bytes, every field that points into the module and the bytes it points at). Very long
+string values (over 1000 characters) are listed without `Text`.
 
 ## Picking long-lived landmarks
 
