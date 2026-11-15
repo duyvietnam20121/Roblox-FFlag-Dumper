@@ -161,4 +161,36 @@ struct Meta {
     return out.good();
 }
 
+// FFlagsSkipped.json: every node the dumper did not turn into an offset, one entry per line, with the raw
+// data needed to understand why (see --dump-skipped).
+[[nodiscard]] inline bool WriteSkipped(const std::filesystem::path& path, const Meta& meta,
+                                       const std::vector<Scanner::SkippedFlag>& skipped) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+
+    std::map<std::string, std::size_t> counts;
+    for (const auto& entry : skipped) ++counts[Scanner::ToString(entry.status)];
+
+    out << "{\n    \"Meta\": { \"RobloxVersion\": \"" << JsonEscape(meta.robloxVersion) << "\", \"GeneratedAt\": \""
+        << meta.generatedAt << "\", \"Count\": " << skipped.size() << " },\n    \"Counts\": {";
+    bool first = true;
+    for (const auto& [reason, count] : counts) {
+        out << (first ? " " : ", ") << '"' << reason << "\": " << count;
+        first = false;
+    }
+    out << " },\n    \"Skipped\": [\n";
+
+    first = true;
+    for (const auto& e : skipped) {
+        if (!first) out << ",\n";
+        first = false;
+        out << "        {\"Reason\": \"" << Scanner::ToString(e.status) << "\", \"Name\": \"" << JsonEscape(e.name)
+            << "\", \"Node\": \"" << Memory::ToHex(e.node) << "\", \"Object\": \"" << Memory::ToHex(e.object)
+            << "\", \"Pointer\": \"" << Memory::ToHex(e.valuePointer) << "\", \"Text\": \"" << JsonEscape(e.text)
+            << "\", \"Raw\": \"" << e.raw << "\"}";
+    }
+    out << "\n    ]\n}\n";
+    return out.good();
+}
+
 }  // namespace Output

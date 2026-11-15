@@ -3,12 +3,15 @@
 //
 // Usage:  RobloxFFlagDumper [--out <dir>] [--process <exe>] [--anchor Name=Value]...
 //                           [--no-verify] [--no-discover] [--values]
+//                           [--dump-skipped] [--inspect <FlagName>]
 //                           [--verbose] [--no-pause] [--help]
 //
 // Exit codes: 0 ok | 1 cannot attach | 2 map not found | 3 dump/IO failure | 64 bad usage
 // ---------------------------------------------------------------------------
 
+#include <cctype>
 #include <charconv>
+#include <fstream>
 #include <filesystem>
 #include <iostream>
 #include <map>
@@ -29,6 +32,8 @@ struct Options {
     Scanner::Config scan;
     bool pause = true;
     bool values = false;
+    bool dumpSkipped = false;
+    std::string inspect;
     bool help = false;
 };
 
@@ -44,6 +49,10 @@ void PrintUsage() {
                  "                         (default: BatchThumbnailMinWaitMs=15)\n"
                  "  --values               also store each flag's current int value in FFlags.json\n"
                  "                         (feed several dumps to pick_anchors.py to find stable anchors)\n"
+                 "  --dump-skipped         also write FFlagsSkipped.json: every node that was NOT turned into an\n"
+                 "                         offset (string-valued, bad pointer...) with raw data, to analyse them\n"
+                 "  --inspect <FlagName>   print a hex report of one flag's node and value object (also saved to\n"
+                 "                         Inspect_<FlagName>.txt); the F/DF/FInt... prefix is optional\n"
                  "  --no-discover          skip the name-based fallback (slow search of all process memory)\n"
                  "  --no-verify            skip the layout verification (coverage + landmark check)\n"
                  "  --verbose              print scanning details\n"
@@ -112,6 +121,12 @@ bool ParseArgs(int argc, char** argv, Options& options) {
             options.scan.anchors.push_back(std::move(anchor));
         } else if (arg == "--values") {
             options.values = true;
+        } else if (arg == "--dump-skipped") {
+            options.dumpSkipped = true;
+        } else if (arg == "--inspect") {
+            const char* value = needValue(arg);
+            if (!value) return false;
+            options.inspect = value;
         } else if (arg == "--no-discover") {
             options.scan.discover = false;
         } else if (arg == "--no-verify") {
@@ -215,8 +230,26 @@ int main(int argc, char** argv) {
               << "ValueGetSet : " << Memory::ToHex(layout->valueGetSet) << '\n'
               << "FlagToValue : " << Memory::ToHex(layout->flagToValue) << '\n';
 
+    // --- inspect (optional) ------------------------------------------------
+    if (!options.inspect.empty()) {
+        const auto report = Scanner::InspectFlag(process, *module, *layout, options.scan, options.inspect);
+        if (!report) {
+            std::cerr << "\n--inspect: flag '" << options.inspect << "' not found in the flag list.\n";
+        } else {
+            std::cout << "\n" << *report;
+            std::string fileName = "Inspect_" + options.inspect + ".txt";
+            for (char& c : fileName) if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_' && c != '.') c = '_';
+            std::error_code dirError;
+            std::filesystem::create_directories(options.outDir, dirError);
+            std::ofstream file(options.outDir / fileName, std::ios::binary | std::ios::trunc);
+            if (file << *report) std::cout << "(saved to " << (options.outDir / fileName).string() << ")\n";
+        }
+    }
+
     // --- dump --------------------------------------------------------------
-    const auto dump = Scanner::DumpFlags(process, *module, *layout, options.scan);
+    Scanner::Config dumpConfig = options.scan;
+    dumpConfig.collectSkipped = options.dumpSkipped;  // (verification dumps stay light)
+    const auto dump = Scanner::DumpFlags(process, *module, *layout, dumpConfig);
     if (!dump || dump->flags.empty()) {
         std::cerr << "Failed to walk the FFlag list.\n";
         return Finish(kDumpFailed, options.pause);
@@ -242,6 +275,14 @@ int main(int argc, char** argv) {
         !Output::WriteHeader(headerPath, meta, *layout, *dump)) {
         std::cerr << "Could not write output files into " << options.outDir.string() << '\n';
         return Finish(kDumpFailed, options.pause);
+    }
+
+    if (options.dumpSkipped) {
+        const auto skippedPath = options.outDir / "FFlagsSkipped.json";
+        if (Output::WriteSkipped(skippedPath, meta, dump->skipped))
+            std::cout << "Skipped entries: " << dump->skipped.size() << " -> " << skippedPath.string() << '\n';
+        else
+            std::cerr << "Could not write " << skippedPath.string() << '\n';
     }
 
     const auto& s = dump->stats;

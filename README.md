@@ -25,7 +25,8 @@ Start Roblox first, then:
 
 ```
 RobloxFFlagDumper [--out <dir>] [--process <exe>] [--anchor Name=Value]...
-                  [--values] [--no-verify] [--no-discover] [--verbose] [--no-pause] [--help]
+                  [--values] [--dump-skipped] [--inspect <FlagName>] [--no-verify] [--no-discover]
+                  [--verbose] [--no-pause] [--help]
 ```
 
 | Option | Meaning |
@@ -34,6 +35,8 @@ RobloxFFlagDumper [--out <dir>] [--process <exe>] [--anchor Name=Value]...
 | `--process <exe>` | Target process (default `RobloxPlayerBeta.exe`) |
 | `--anchor Name=Value` | Landmark: an **integer** flag with a known value. Repeatable, **max 4** (`--anchor2` is an alias). See [Landmarks](#landmarks). |
 | `--values` | Also store each flag's current int value in `FFlags.json` (`Values` block) - input for `pick_anchors.py` |
+| `--dump-skipped` | Also write `FFlagsSkipped.json`: every node that was **not** turned into an offset (reason, node/object addresses, raw bytes), see [Skipped flags](#skipped-flags) |
+| `--inspect <FlagName>` | Print (and save to `Inspect_<FlagName>.txt`) a hex report of one flag's node and value object. The `F` / `DF` / `FInt`... prefix is optional |
 | `--no-discover` | Skip the name-based fallback (see [How it works](#how-it-works)) |
 | `--no-verify` | Skip layout verification |
 | `--verbose` | Print scanning and verification details |
@@ -100,6 +103,22 @@ statistics of the name-based search, which tell whether memory was unreadable or
 
 The thresholds (50% / 80%) are empirical; if a correct layout is rejected, run with `--verbose` and
 `--no-verify` and compare.
+
+## Skipped flags
+
+About half of the nodes in the map are not written to `FFlags.json`. The dumper only keeps entries whose
+value pointer leads **into the module image**; the rest are skipped with one of these reasons:
+
+| Reason | Meaning |
+| --- | --- |
+| `string-valued` | the spot where the value pointer is expected holds the text `True` / `False` (typically bool flags) |
+| `bad-value-pointer` | the pointer there does not lead into the module image |
+| `bad-object` | the node has no readable value object |
+| `bad-name` | the node's name is not a valid string |
+
+`--dump-skipped` lists them all with raw data, and `--inspect DebugGraphicsPreferD3D11` shows one flag in detail
+(node bytes, value-object bytes, every field that points into the module and the bytes it points at). Use these
+to find where bool flags keep their value; run `--dump-skipped` and `--inspect` with Roblox fully loaded.
 
 ## Picking long-lived landmarks
 

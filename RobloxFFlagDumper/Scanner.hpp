@@ -30,6 +30,7 @@
 #include <cstdio>
 #include <iostream>
 #include <map>
+#include <sstream>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -71,6 +72,7 @@ struct Config {
     // locate the layout and one matching value is enough, so a Roblox update that changes one
     // default does not break the tool. Landmarks given with --anchor are strict (RequiredMatches).
     bool defaultAnchors = true;
+    bool collectSkipped = false;                         // keep details of skipped entries (--dump-skipped)
     bool discover = true;                                // name-based fallback (--no-discover)
     bool verify = true;                                  // --no-verify disables the checks
     double minCoverage = 0.5;                            // share of usable entries required
@@ -165,8 +167,34 @@ struct DumpStats {
     bool truncated = false;  // hit Config::maxListNodes
 };
 
+// How the dumper classifies one list node.
+enum class NodeStatus { Dumped, BadName, BadObject, StringValue, BadValuePointer };
+
+[[nodiscard]] inline const char* ToString(NodeStatus status) noexcept {
+    switch (status) {
+        case NodeStatus::Dumped: return "dumped";
+        case NodeStatus::BadName: return "bad-name";
+        case NodeStatus::BadObject: return "bad-object";
+        case NodeStatus::StringValue: return "string-valued";
+        case NodeStatus::BadValuePointer: return "bad-value-pointer";
+    }
+    return "unknown";
+}
+
+// A node the dumper did not turn into an offset, with the raw data needed to understand why.
+struct SkippedFlag {
+    NodeStatus status = NodeStatus::BadName;
+    std::string name;                // empty for bad-name
+    std::uintptr_t node = 0;
+    std::uintptr_t object = 0;       // node + ValueGetSet (0 if unreadable)
+    std::uintptr_t valuePointer = 0; // 8 bytes at object + FlagToValue
+    std::string text;                // std::string found at object + FlagToValue, if any
+    std::string raw;                 // 32 raw bytes (hex) at object + FlagToValue (node + 0x10 for bad-name)
+};
+
 struct DumpResult {
     std::map<std::string, std::uintptr_t> flags;  // name -> RVA, sorted => stable diffs
+    std::vector<SkippedFlag> skipped;             // only filled with Config::collectSkipped
     DumpStats stats;
 };
 
@@ -227,6 +255,65 @@ struct VerifyInfo {
     return ranges;
 }
 
+struct NodeInfo {
+    NodeStatus status = NodeStatus::BadName;
+    std::string name;
+    std::uintptr_t object = 0;        // node + ValueGetSet
+    std::uintptr_t valuePointer = 0;  // 8 bytes at object + FlagToValue
+    std::string text;                 // std::string at object + FlagToValue, if it looks like one
+    std::uintptr_t rva = 0;           // value address relative to the module (Dumped only)
+};
+
+// The single place that decides what a list node is (shared by the dump and --inspect).
+[[nodiscard]] inline NodeInfo ClassifyNode(const Memory::Process& process, const Memory::ModuleInfo& module,
+                                           const Layout& layout, std::uintptr_t node) {
+    NodeInfo info;
+
+    const auto name = process.ReadMsvcString(node + kNodeNameOffset);
+    if (!name) return info;  // BadName
+    info.name = *name;
+
+    const auto object = process.Read<std::uintptr_t>(node + layout.valueGetSet);
+    if (!object || !Memory::IsUserPointer(*object)) {
+        info.status = NodeStatus::BadObject;
+        return info;
+    }
+    info.object = *object;
+
+    if (const auto text = process.ReadMsvcString(*object + layout.flagToValue)) info.text = *text;
+    if (const auto pointer = process.Read<std::uintptr_t>(*object + layout.flagToValue)) info.valuePointer = *pointer;
+
+    // Entries whose "value" is the text True/False are not offsets.
+    if (info.text == "True" || info.text == "False") {
+        info.status = NodeStatus::StringValue;
+        return info;
+    }
+
+    // The value must live inside the module image, otherwise the RVA is meaningless.
+    if (info.valuePointer < module.base || info.valuePointer - module.base >= module.size ||
+        info.valuePointer - module.base < kMinValueRva) {
+        info.status = NodeStatus::BadValuePointer;
+        return info;
+    }
+
+    info.status = NodeStatus::Dumped;
+    info.rva = info.valuePointer - module.base;
+    return info;
+}
+
+// "00 1f ..." for `size` bytes at `address`, or "(unreadable)".
+[[nodiscard]] inline std::string HexBytes(const Memory::Process& process, std::uintptr_t address, std::size_t size) {
+    std::vector<std::uint8_t> bytes(size);
+    if (!process.ReadBytes(address, bytes.data(), size)) return "(unreadable)";
+    std::string out;
+    char item[8];
+    for (std::size_t i = 0; i < size; ++i) {
+        std::snprintf(item, sizeof(item), i ? " %02x" : "%02x", bytes[i]);
+        out += item;
+    }
+    return out;
+}
+
 // Walks the flag list and collects name -> RVA for every usable entry.
 [[nodiscard]] inline std::optional<DumpResult> DumpFlags(const Memory::Process& process,
                                                          const Memory::ModuleInfo& module,
@@ -251,40 +338,112 @@ struct VerifyInfo {
         }
         ++stats.nodes;
 
-        // Read the successor first so every `continue` below can still advance.
+        // Read the successor first, then classify.
         const auto next = process.Read<std::uintptr_t>(node);
+        const NodeInfo info = ClassifyNode(process, module, layout, node);
 
-        [&] {
-            const auto name = process.ReadMsvcString(node + kNodeNameOffset);
-            if (!name) { ++stats.badName; return; }
+        switch (info.status) {
+            case NodeStatus::Dumped:
+                if (result.flags.emplace(info.name, info.rva).second) ++stats.dumped;
+                else ++stats.duplicates;
+                break;
+            case NodeStatus::BadName: ++stats.badName; break;
+            case NodeStatus::BadObject:
+            case NodeStatus::BadValuePointer: ++stats.badPointer; break;
+            case NodeStatus::StringValue: ++stats.stringValued; break;
+        }
 
-            const auto getSet = process.Read<std::uintptr_t>(node + layout.valueGetSet);
-            if (!getSet || !Memory::IsUserPointer(*getSet)) { ++stats.badPointer; return; }
-
-            // Entries whose "value" is the text True/False are not offsets.
-            if (const auto text = process.ReadMsvcString(*getSet + layout.flagToValue);
-                text && (*text == "True" || *text == "False")) {
-                ++stats.stringValued;
-                return;
-            }
-
-            const auto valuePointer = process.Read<std::uintptr_t>(*getSet + layout.flagToValue);
-            // The value must live inside the module image, otherwise the RVA is meaningless.
-            if (!valuePointer || *valuePointer < module.base ||
-                *valuePointer - module.base >= module.size ||
-                *valuePointer - module.base < kMinValueRva) {
-                ++stats.badPointer;
-                return;
-            }
-
-            if (result.flags.emplace(*name, *valuePointer - module.base).second) ++stats.dumped;
-            else ++stats.duplicates;
-        }();
+        if (info.status != NodeStatus::Dumped && config.collectSkipped) {
+            SkippedFlag entry;
+            entry.status = info.status;
+            entry.name = info.name;
+            entry.node = node;
+            entry.object = info.object;
+            entry.valuePointer = info.valuePointer;
+            entry.text = info.text;
+            entry.raw = info.status == NodeStatus::BadName ? HexBytes(process, node + kNodeNameOffset, 32)
+                        : info.object ? HexBytes(process, info.object + layout.flagToValue, 32)
+                                      : std::string();
+            result.skipped.push_back(std::move(entry));
+        }
 
         if (!next || *next == node) break;
         node = *next;
     }
     return result;
+}
+
+// --inspect: a human-readable report about one flag's node and value object.
+// Accepts the name with or without its type prefix (FFlag, DFInt, ...).
+[[nodiscard]] inline std::optional<std::string> InspectFlag(const Memory::Process& process,
+                                                            const Memory::ModuleInfo& module,
+                                                            const Layout& layout, const Config& config,
+                                                            const std::string& wanted) {
+    static const char* const kPrefixes[] = {"DFFlag", "DFInt", "DFString", "DFLog", "SFFlag", "FFlag",
+                                            "FInt",   "FString", "FLog"};
+    std::vector<std::string> names{wanted};
+    for (const char* prefix : kPrefixes) {
+        const std::string_view p(prefix);
+        if (wanted.size() > p.size() && wanted.compare(0, p.size(), p) == 0) names.push_back(wanted.substr(p.size()));
+    }
+
+    const auto mapObject = ResolveMapObject(process, module, layout);
+    if (!mapObject) return std::nullopt;
+    const auto head = process.Read<std::uintptr_t>(*mapObject + kMapHeadOffset);
+    if (!head) return std::nullopt;
+    auto node = process.Read<std::uintptr_t>(*head);
+
+    std::size_t visited = 0;
+    while (node && Memory::IsUserPointer(*node) && *node != *head && visited++ < config.maxListNodes) {
+        const auto name = process.ReadMsvcString(*node + kNodeNameOffset);
+        if (name && std::find(names.begin(), names.end(), *name) != names.end()) break;
+        const auto next = process.Read<std::uintptr_t>(*node);
+        if (!next || *next == *node) return std::nullopt;
+        node = next;
+    }
+    if (!node || !Memory::IsUserPointer(*node) || *node == *head) return std::nullopt;
+
+    const NodeInfo info = ClassifyNode(process, module, layout, *node);
+    const auto where = [&](std::uintptr_t address) {
+        if (address >= module.base && address < module.base + module.size)
+            return Memory::ToHex(address) + " (module RVA " + Memory::ToHex(address - module.base) + ")";
+        return Memory::ToHex(address);
+    };
+    // Qwords inside [address, address + size) that point into the module, with the bytes they point at.
+    const auto modulePointers = [&](std::uintptr_t address, std::size_t size) {
+        std::string out;
+        for (std::size_t off = 0; off + 8 <= size; off += 8) {
+            const auto value = process.Read<std::uintptr_t>(address + off);
+            if (value && *value >= module.base && *value < module.base + module.size)
+                out += "  +" + Memory::ToHex(off) + " -> RVA " + Memory::ToHex(*value - module.base) + ", bytes there: " +
+                       HexBytes(process, *value, 8) + "\n";
+        }
+        return out.empty() ? std::string("  (none)\n") : out;
+    };
+
+    std::ostringstream r;
+    r << "Flag          : " << info.name << "  (searched as " << wanted << ")\n"
+      << "Classified as : " << ToString(info.status) << '\n'
+      << "Node          : " << where(*node) << '\n'
+      << "Node bytes (+0x00, 0x60):\n" << HexDump(process, *node, 0x60)
+      << "Node fields pointing into the module:\n" << modulePointers(*node, 0x60);
+    if (info.object) {
+        r << "ValueGetSet   : " << where(info.object) << "  (node + " << Memory::ToHex(layout.valueGetSet) << ")\n"
+          << "Object bytes (+0x00, 0x100):\n" << HexDump(process, info.object, 0x100)
+          << "Object fields pointing into the module:\n" << modulePointers(info.object, 0x100)
+          << "At object + " << Memory::ToHex(layout.flagToValue) << " (FlagToValue):\n"
+          << "  raw 32 bytes : " << HexBytes(process, info.object + layout.flagToValue, 32) << '\n'
+          << "  as pointer   : " << where(info.valuePointer) << '\n'
+          << "  as std::string: " << (info.text.empty() ? std::string("(not a valid string)") : "\"" + info.text + "\"") << '\n';
+        if (Memory::IsUserPointer(info.valuePointer)) {
+            r << "  target bytes : " << HexBytes(process, info.valuePointer, 32) << '\n';
+            if (const auto i32 = process.Read<std::int32_t>(info.valuePointer)) r << "  int32 there  : " << *i32 << '\n';
+            if (const auto i8 = process.Read<std::uint8_t>(info.valuePointer)) r << "  uint8 there  : " << static_cast<int>(*i8) << '\n';
+        }
+    } else {
+        r << "(no valid ValueGetSet object at node + " << Memory::ToHex(layout.valueGetSet) << ")\n";
+    }
+    return r.str();
 }
 
 class LayoutFinder {
